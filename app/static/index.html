@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Personal Chef AI - 您的智慧私人廚師助手">
+  <title>Personal Chef AI</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👨‍🍳</text></svg>">
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-logo">
+          <div class="logo-icon">🍳</div>
+          <span class="logo-text">Personal Chef</span>
+        </div>
+        <button class="new-chat-btn" id="newChatBtn" onclick="createNewThread()">
+          <span class="icon">＋</span>
+          新對話
+        </button>
+      </div>
+      <div class="thread-list" id="threadList">
+        <div class="thread-list-title">對話記錄</div>
+        <div class="empty-threads" id="emptyThreads">
+          <div class="empty-icon">💬</div>
+          <div>還沒有對話記錄</div>
+        </div>
+      </div>
+      <div class="sidebar-footer">
+        Powered by LangGraph + Groq
+      </div>
+    </aside>
+
+    <!-- Mobile Sidebar Overlay -->
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Header -->
+      <header class="chat-header">
+        <div class="chat-header-left">
+          <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+          <div>
+            <div class="chat-title" id="chatTitle">新對話</div>
+            <div class="chat-status">
+              <span class="status-dot"></span>
+              <span>線上</span>
+            </div>
+          </div>
+        </div>
+        <div class="chat-header-right">
+          <button class="header-btn" onclick="clearCurrentChat()" title="清除對話">🗑️</button>
+        </div>
+      </header>
+
+      <!-- Messages -->
+      <div class="messages-container" id="messagesContainer">
+        <div class="messages-wrapper" id="messagesWrapper">
+          <!-- Welcome Screen -->
+          <div class="welcome-screen" id="welcomeScreen">
+            <div class="welcome-icon">👨‍🍳</div>
+            <h1 class="welcome-title">您的私人廚師已就緒</h1>
+            <p class="welcome-subtitle">告訴我您手邊有什麼食材，或想做什麼料理？</p>
+            <div class="quick-actions">
+              <div class="quick-action" onclick="sendQuickAction('我手邊有雞胸肉、花椰菜和蒜頭，可以做什麼料理？')">
+                <div class="quick-action-icon">🥦</div>
+                <div class="quick-action-text">用現有食材推薦料理</div>
+              </div>
+              <div class="quick-action" onclick="sendQuickAction('請教我做日式咖哩飯的步驟')">
+                <div class="quick-action-icon">🍛</div>
+                <div class="quick-action-text">學習一道新菜的做法</div>
+              </div>
+              <div class="quick-action" onclick="sendQuickAction('推薦一些適合新手的家常菜食譜')">
+                <div class="quick-action-icon">📖</div>
+                <div class="quick-action-text">推薦新手友善食譜</div>
+              </div>
+              <div class="quick-action" onclick="sendQuickAction('如何在30分鐘內做出一桌三菜一湯？')">
+                <div class="quick-action-icon">⏰</div>
+                <div class="quick-action-text">快速做出一桌料理</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <div class="input-area">
+        <div class="input-wrapper">
+          <!-- Image Preview -->
+          <div class="image-preview-container" id="imagePreviewContainer">
+            <img class="image-preview" id="imagePreview" src="" alt="preview">
+            <button class="image-preview-remove" onclick="removeImage()">✕</button>
+          </div>
+          <!-- Input Box -->
+          <div class="input-box" id="inputBox">
+            <textarea
+              id="messageInput"
+              placeholder="輸入訊息... (Ctrl+Enter 送出)"
+              rows="1"
+              oninput="autoResize(this)"
+              onkeydown="handleKeyDown(event)"
+            ></textarea>
+            <div class="input-actions">
+              <button class="input-btn" onclick="triggerImageUpload()" title="上傳圖片">📎</button>
+              <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>➤</button>
+            </div>
+          </div>
+          <div class="input-hint">
+            按 Ctrl + Enter 送出 · 支援圖片上傳
+          </div>
+        </div>
+      </div>
+
+      <!-- Hidden File Input -->
+      <input type="file" id="imageFileInput" accept="image/*" onchange="handleImageSelect(event)" style="display:none">
+    </main>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+app/rugged-choir-455105-b2-9e87e2065111.json
+*-key.json
+*service-account*.json
+
+# Logs
+*.log
+
+# 編輯器與 IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 測試與快取
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 作業系統檔案
+.DS_Store
+Thumbs.db
+
+# 專案產出檔案
+evals/results/
+*.db
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
