@@ -1,95 +1,180 @@
+"""LLM tool router：用「Query Rewrite → Hybrid Search（dense + BM25）→ RRF 融合」
+選出動態工具，再與基底工具聯集，覆寫本輪送進主模型的工具集。
+
+規模說明：本專案只有 14 個工具，其實把全部工具丟給模型就夠了；這套檢索管線是為
+「工具多到塞不進 context」的規模設計的，此處完整實作純為練習業界標準管線。檢索後端
+（Qdrant 索引與 Hybrid+RRF 查詢）在 tool_index.py。
+
+分層設計：
+- 基底工具（Base Tools）：每輪都在場。set_goal 必須隨時可呼叫（換任務時記錄目標）；
+  profiles_get / inventory_get / web_search 是推薦類任務的骨幹，且檢索召回率非 100%
+  （實測「推薦晚餐」會漏撈 web_search），用基底兜住這種漏撈。
+- 動態工具（Dynamic Tools）：對「重寫後的查詢」做 Hybrid Search 取 Top-K。
+- 圖片：偵測到本輪含圖片時，強制補 inventory_add（沿用原關鍵字 router 的行為）。
+"""
+
 from collections.abc import Awaitable, Callable
 
 from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agents.tools import ALL_TOOLS
+from app.agents.tool_index import retrieve_tool_names
 
 _TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
-# 不管命中哪條規則都保留的核心工具，避免 ReAct 中途想用卻被鎖死拿不到。
-# set_goal 必須每圈在場：LLM 判斷使用者換任務時要能隨時呼叫它記錄新目標。
-_CORE_TOOLS: set[str] = {"profiles_get", "inventory_get", "web_search", "set_goal"}
+# 基底工具：不管檢索結果如何都保留（理由見模組 docstring）。
+_BASE_TOOLS: set[str] = {"profiles_get", "inventory_get", "web_search", "set_goal"}
 
-# 每輪納入判斷的最近訊息數（含 AI 文字、tool 輸出），讓 router 能看到「目前執行狀態」
-# 而非只看最初那句話，否則 step 1 查完冰箱、step 2 才發現需要的工具會永遠呼叫不到
-_CONTEXT_WINDOW = 8
+# 每輪 Hybrid Search 取幾個動態工具（spec 的 Top 5）
+_RETRIEVE_LIMIT = 5
 
-# call_agent 收到圖片時，會先呼叫 vision_model 把圖片轉成純文字描述再組進訊息
-# （見 app.py call_agent），送進主 agent 的訊息已不含 image_url content block，
-# 下面 _extract_recent_context 的 image_url 偵測抓不到。故額外用這個固定字串
-# 當「本輪含圖片」的訊號——沿用本檔既有的關鍵字比對風格，而非額外傳遞旗標。
+# 送進 query rewrite 的最近訊息數（含使用者輸入、AI 文字、tool 輸出），
+# 讓重寫助理能解析代名詞與延續性指令（「下一步」「那雞胸肉呢」）。
+_CONTEXT_WINDOW = 6
+
+# call_agent 收到圖片時會把 vision 描述以固定字串組進訊息（見 app.py），
+# 主 agent 收到的訊息已不含 image_url block，靠這個標記判斷「本輪含圖片」。
 _IMAGE_MARKER = "系統自動辨識圖片中的食材"
 
-_RULES: list[tuple[list[str], list[str]]] = [
-    (
-        ["我有", "買了", "我買", "冰箱有", "還剩", "剛買"],
-        ["inventory_add"],
-    ),
-    (
-        ["用完", "沒了", "過期", "丟掉", "吃完", "用掉"],
-        ["inventory_remove"],
-    ),
-    (
-        ["過敏", "不吃", "吃素", "忌口", "討厭", "素食", "vegan", "vegetarian", "halal", "keto",
-         "重口味", "清淡", "不辣", "偏甜", "偏鹹", "台式", "日式", "韓式", "義式", "快炒",
-         "減重", "增肌", "控糖", "低鈉", "瘦身", "健康飲食"],
-        ["diet_profile_manage"],
-    ),
-    (
-        ["氣炸鍋", "烤箱", "電鍋", "瓦斯爐", "廚具", "鍋", "新手", "不會煮", "沒時間", "分鐘"],
-        ["kitchen_profile_manage"],
-    ),
-    (
-        ["家人", "家裡", "女兒", "兒子", "老婆", "老公", "小孩", "孩子", "懷孕", "幾人份", "全家"],
-        ["household_profile_manage"],
-    ),
-    (
-        ["下一步", "然後呢", "第幾步", "接下來", "繼續", "下步"],
-        ["step_tracker_next", "step_tracker_current"],
-    ),
-    (
-        ["缺", "要買", "購物", "採買", "需要買"],
-        ["shopping_list_generate", "inventory_get"],
-    ),
-    (
-        ["熱量", "卡路里", "營養", "蛋白質", "脂肪", "碳水"],
-        ["nutrition_lookup"],
-    ),
-    (
-        ["推薦", "想吃", "食譜", "怎麼做", "教我", "料理", "做法", "煮什麼", "吃什麼", "學做"],
-        ["profiles_get", "inventory_get", "web_search",
-         "shopping_list_generate", "nutrition_lookup", "step_tracker_start"],
-    ),
-    (
-        ["冰箱", "庫存", "有什麼食材", "有哪些食材"],
-        ["inventory_get"],
-    ),
-]
+# 由 app.py init_agent_infra 注入 summary_model（Groq llama-3.1-8b-instant，低延遲）。
+# None 表示尚未啟用 → 跳過重寫，直接用原文檢索。沿用 tools.py 的注入慣例。
+_rewrite_model = None
+
+_REWRITE_PROMPT = """你是一個「意圖翻譯官」，只翻譯使用者當下想做的「動作」，用來檢索最合適的工具。
+
+【嚴格禁忌】
+1. 絕對不要預測答案、不要接續對話、不要幫使用者把下一步的具體內容編出來！
+2. 絕對不可以遺漏使用者提到的「關鍵實體、食材、過敏原或限制條件」！
+
+【核心原則】
+- 如果使用者是在「陳述狀況、過敏原、飲食限制或個人偏好」，請 100% 保留所有名詞與條件，不可簡化為抽象句。
+
+【範例 1：代名詞與主詞還原】
+歷史：使用者：幫我查 A 專案的進度 / 助理：已完成 80%
+使用者最後一句：那 B 專案呢
+輸出：<query>查詢 B 專案的進度</query>
+
+【範例 2：系統流程指令 (純動作，不預測內容)】
+歷史：助理：第一步：請輸入舊密碼
+使用者最後一句：下一步
+輸出：<query>前進到流程的下一個步驟</query>
+（❌ 錯誤示範，不要這樣寫：<query>輸入新密碼</query>——這是在編造下一步內容）
+
+【範例 3：對話確認/否定 (僅在助理主動詢問時套用)】
+歷史：助理：確認要刪除這筆紀錄嗎？
+使用者最後一句：對，都刪了吧
+輸出：<query>確認執行刪除操作</query>
+
+【範例 4：陳述個人狀況/過敏限制 (關鍵詞全留)】
+歷史：（無）
+使用者最後一句：我對花生過敏，不能吃蝦
+輸出：<query>記錄對花生過敏且不能吃蝦的飲食限制</query>
+（❌ 錯誤示範，不要這樣寫：<query>確認不能吃蝦</query>——這遺漏了過敏原名詞）
+
+規則：
+- 消除代名詞與上下文依賴，但只還原「動作」，不要補充猜測內容。
+- 必須完整保留所有的「過敏原、食材、數量、偏好」。
+
+【輸出格式】
+你必須且只能將最終的重寫結果包在 <query> 與 </query> 標籤中，不管前面加了什麼說明文字都沒關係，
+只有標籤內的內容會被採用。例如：<query>查詢台北天氣</query>
+
+<對話歷史>
+{history}
+</對話歷史>
+
+<使用者最後一句>
+{latest}
+</使用者最後一句>"""
 
 
-def _extract_recent_context(messages) -> tuple[str, bool]:
-    """回傳 (最近 _CONTEXT_WINDOW 則訊息合併文字, 是否含圖片)。
+def _clean(text: str) -> str:
+    """去掉 <user_input>/<tool_output> 這類隔離標籤，讓重寫助理看到乾淨文字。"""
+    for tag in ("<user_input>", "</user_input>", "<tool_output>", "</tool_output>"):
+        text = text.replace(tag, "")
+    return text.strip()
 
-    掃描 HumanMessage / AIMessage / ToolMessage 的文字內容，讓 router 能看到
-    「目前執行狀態」（含上一輪 tool 輸出），而非只看最初那句使用者輸入。
-    訊息數少於 window 時，切片自然回傳全部，不會出錯。
+
+def _msg_text(msg) -> str:
+    """取一則訊息的純文字內容（list 型 content 只取 text 片段）。"""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(parts)
+    return ""
+
+
+def _extract_context(messages) -> tuple[str, str, bool]:
+    """回傳 (對話歷史文字, 使用者最後一句, 是否含圖片)。
+
+    歷史 = 最近 _CONTEXT_WINDOW 則的角色標記文字；最後一句 = 最後一則 HumanMessage。
     """
-    text_parts: list[str] = []
+    window = messages[-_CONTEXT_WINDOW:]
     has_image = False
-    for msg in messages[-_CONTEXT_WINDOW:]:
-        content = msg.content
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                    elif item.get("type") == "image_url":
-                        has_image = True
-                elif isinstance(item, str):
-                    text_parts.append(item)
-    return " ".join(text_parts), has_image
+    history_lines: list[str] = []
+    for m in window:
+        text = _clean(_msg_text(m))
+        if _IMAGE_MARKER in text:
+            has_image = True
+        if not text:
+            continue
+        if isinstance(m, HumanMessage):
+            history_lines.append(f"使用者：{text}")
+        elif isinstance(m, AIMessage):
+            history_lines.append(f"助理：{text}")
+
+    latest = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            latest = _clean(_msg_text(m))
+            break
+
+    return "\n".join(history_lines), latest, has_image
+
+
+async def _rewrite_query(history: str, latest: str) -> str:
+    """Step 1 Query Rewrite：小模型消代名詞。失敗或未啟用時退回原文。
+
+    callbacks=[] 切斷與外層 run 的 callback 鏈，避免這次側呼叫的輸出被 astream
+    的 messages 模式當成正常串流丟給使用者（同 DietarySafetyGuard 的做法）。
+    """
+    if _rewrite_model is None or not latest:
+        return latest
+    try:
+        resp = await _rewrite_model.ainvoke(
+            _REWRITE_PROMPT.format(history=history or "（無）", latest=latest),
+            config={"callbacks": []},
+        )
+        raw = resp.content or ""
+        # 用「最後一個」<query> 開始位置定位，不用 re.search 抓第一個匹配：
+        # 8B 小模型常會先用自己的話複誦一次指令（含「包在 <query> 標籤中」這種
+        # 字面提及），若複誦文字裡剛好只有一組 <query>...</query> 閉合，
+        # search 會誤把「指令說明本身」當成要擷取的內容，把中間所有雜訊
+        # 都吞進去。真正的答案幾乎必定是模型最後才給的，故取最後一次出現。
+        last_open = raw.rfind("<query>")
+        cleaned = ""
+        if last_open != -1:
+            remainder = raw[last_open + len("<query>"):]
+            close_idx = remainder.find("</query>")
+            content = remainder[:close_idx] if close_idx != -1 else remainder
+            cleaned = content.strip()
+        if cleaned:
+            return cleaned
+        # 沒抓到標籤或標籤內是空的，代表這次生成壞掉了，保底退回原文，
+        # 不讓垃圾字串靜默流進檢索（同本專案零信任的一貫原則）。
+        print(f"⚠️ [ROUTER] 未解析出 <query> 標籤，改用原文。原始輸出：{raw!r}")
+        return latest
+    except Exception as exc:
+        print(f"⚠️ [ROUTER] query rewrite 失敗，改用原文：{type(exc).__name__}: {exc}")
+        return latest
 
 
 @wrap_model_call
@@ -97,17 +182,20 @@ async def tool_router(
     request: ModelRequest,
     handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
 ) -> ModelResponse:
-    text, has_image = _extract_recent_context(request.messages)
+    history, latest, has_image = _extract_context(request.messages)
 
-    selected: set[str] = set(_CORE_TOOLS)  # 保底：核心工具每輪都在場
+    # Step 1：查詢重寫（消代名詞、補意圖）
+    query = await _rewrite_query(history, latest)
 
-    if has_image or _IMAGE_MARKER in text:
+    # Step 2-3：Hybrid Search（dense + BM25）+ RRF 融合，取動態工具
+    dynamic = await retrieve_tool_names(query, limit=_RETRIEVE_LIMIT)
+
+    # Step 4：基底工具 + 動態工具（+ 圖片強制補 inventory_add）
+    selected: set[str] = set(_BASE_TOOLS)
+    selected.update(dynamic)
+    if has_image:
         selected.add("inventory_add")
 
-    for keywords, tools in _RULES:
-        if any(kw in text for kw in keywords):
-            selected.update(tools)
-
     subset = [_TOOL_MAP[name] for name in selected if name in _TOOL_MAP]
-    print(f"🧭 [ROUTER] {sorted(name for t in subset for name in [t.name])}")
+    print(f"🧭 [ROUTER] rewrite={query!r} dynamic={dynamic} → {sorted(t.name for t in subset)}")
     return await handler(request.override(tools=subset))

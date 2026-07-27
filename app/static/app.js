@@ -327,8 +327,13 @@ function renderInterrupt(actionRequests) {
   const el = document.createElement('div');
   el.className = 'message assistant';
 
+  // 後端 InterruptOnConfig 的 description 已是可直接顯示的中文說明（見 app.py
+   // _describe_inventory_remove / _describe_profile_delete）；優先用它，沒有才
+   // 退回顯示 name(args) 原始資訊。description 可能含換行，用 white-space 保留。
   const list = actionRequests.map(a =>
-    `<div class="hitl-tool">🔧 <strong>${escapeHtml(a.name)}</strong>(${escapeHtml(JSON.stringify(a.args))})</div>`
+    a.description
+      ? `<div class="hitl-tool" style="white-space:pre-wrap">🔧 ${escapeHtml(a.description)}</div>`
+      : `<div class="hitl-tool">🔧 <strong>${escapeHtml(a.name)}</strong>(${escapeHtml(JSON.stringify(a.args))})</div>`
   ).join('');
 
   el.innerHTML = `

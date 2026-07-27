@@ -27,6 +27,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import (
     AgentMiddleware,
     HumanInTheLoopMiddleware,
+    InterruptOnConfig,
     ModelCallLimitMiddleware,
     SummarizationMiddleware,
 )
@@ -52,12 +53,14 @@ from app.agents.tools import (
     _PROFILE_DOMAINS,
     _profile_ns,
 )
+import app.agents.router as _router_module
 from app.agents.router import tool_router
-from app.agents.lessons import (
-    active_lessons,
+from app.agents.tool_index import ensure_index
+from app.agents.auditor import (
+    active_error_rules,
     fire_and_forget,
-    record_lesson,
-    set_enabled as set_lessons_enabled,
+    init_auditor,
+    run_auditor,
 )
 
 MAX_STEPS = 15       # agent 最多呼叫工具幾次（超過強制終止）
@@ -86,6 +89,8 @@ model = init_chat_model(
     temperature=0,
     request_timeout=50.0,
     max_retries=3,
+    frequency_penalty=0.3,   # 抑制 token 重複退化（見 2026-07-20 排查的鬼打牆回覆）
+    presence_penalty=0.3,
 )
 
 # 摘要任務（摘要壓縮／web_search 蒸餾／過敏原安全檢查等輕量子任務）換成 Groq 的
@@ -302,17 +307,14 @@ class ContextShaping(AgentMiddleware):
                 f"（若下方對話中使用者最新的請求與此目標不一致，一律以使用者最新請求為準。）"
             )
 
-        # 教訓記憶（procedural memory）：把「已重複發生過」的失敗模式當常駐行為規則注入。
-        # 這裡是 LangMem 定義的 procedural memory 注入點——與 semantic/episodic 不同，
-        # 程序性規則不做檢索，每輪直接進 system prompt；配合 lessons.py 的次數門檻與
-        # 條數上限，成本封頂約 150 token，且不會誤配到不相關的教訓。
-        store = request.runtime.store
+        # 防呆規則（procedural memory）：由 Auditor Agent 事後分析軌跡並存入資料庫，
+        # 每輪由此注入 system prompt。hits 達門檻才生效，避免偶發事件干擾。
         user_id = get_config().get("configurable", {}).get("user_id", DEFAULT_USER_ID)
-        lessons = await active_lessons(store, user_id)
-        if lessons:
+        error_rules = await active_error_rules(user_id)
+        if error_rules:
             system_message = (
-                f"{system_message}\n\n【過去反覆出現的問題（務必避免重蹈）】\n"
-                + "\n".join(f"- {l}" for l in lessons)
+                f"{system_message}\n\n【過去發生過的錯誤與防呆規則（務必遵守）】\n"
+                + "\n".join(f"- {r}" for r in error_rules)
             )
 
         request = request.override(messages=shaped, system_message=system_message)
@@ -402,22 +404,18 @@ class DietarySafetyGuard(AgentMiddleware):
 
     @staticmethod
     def _extract_text(result: list) -> str:
-        """把回覆中所有「會被使用者當成推薦內容」的文字組起來。
+        """把回覆中會被使用者當成推薦內容的文字組起來（僅 AIMessage 正文）。
 
-        除了 AIMessage 正文，也含 step_tracker_start 的菜名與步驟——食譜內容
-        不會出現在正文裡而是在工具參數中，漏檢會讓含過敏原的食譜整份放行。
+        帶 tool_calls 的輪（例如 step_tracker_start）不會走到這裡——
+        awrap_model_call 對這種輪直接放行不評估，因為那還不是「使用者會看到
+        的內容」。食譜內容要等下一輪模型讀了 ToolMessage、用散文向使用者
+        說明這一步時才會浮出，屆時那一輪才是真正的退出候選，會被評估，
+        不會漏檢，只是比「一次性驗完整份食譜」晚幾輪才驗到。
         """
-        text_parts: list[str] = []
-        for m in result:
-            if isinstance(m, AIMessage):
-                if isinstance(m.content, str):
-                    text_parts.append(m.content)
-                for tc in m.tool_calls or []:
-                    if tc["name"] == "step_tracker_start":
-                        args = tc.get("args", {})
-                        text_parts.append(str(args.get("recipe_name", "")))
-                        text_parts.append(" ".join(args.get("steps", []) or []))
-        return " ".join(text_parts)
+        return " ".join(
+            m.content for m in result
+            if isinstance(m, AIMessage) and isinstance(m.content, str)
+        )
 
     async def awrap_model_call(self, request, handler):
         store = request.runtime.store
@@ -434,14 +432,21 @@ class DietarySafetyGuard(AgentMiddleware):
         response = None
         for attempt in range(self.MAX_RETRY + 1):
             response = await handler(current_request)
+
+            # lazy 退出閘：還在呼叫工具 = loop 尚未退出，這一輪不是「使用者會看到
+            # 的最終內容」（食譜等內容此時還在 tool 參數/state，尚未浮出成散文），
+            # 不評估直接放行。等模型停止呼叫工具、把內容講成散文那一輪才是退出
+            # 候選，屆時再評估——使用者實際看到的每一句都會被驗過。
+            last = response.result[-1] if response.result else None
+            if isinstance(last, AIMessage) and last.tool_calls:
+                return response
+
             hit = await _find_recommended_allergen(allergies, self._extract_text(response.result))
             if hit is None:
                 return response
 
             print(f"🚨 [DIET-GUARD] 偵測到過敏原「{hit}」於推薦內容中（第 {attempt + 1} 次）")
-            # 只在本輪首次命中記錄，否則重試迴圈會把同一次事件灌成 3 筆 hits
-            if attempt == 0:
-                fire_and_forget(record_lesson(store, user_id, "allergen", hit))
+            # allergen 事件由 Auditor Agent 在 run 結束後分析軌跡識別並記錄。
             if attempt == self.MAX_RETRY:
                 safe_msg = AIMessage(
                     content=f"抱歉，我剛才的建議可能含有你的過敏原「{hit}」，"
@@ -522,10 +527,8 @@ class SoftLanding(AgentMiddleware):
         rounds = _tool_rounds_this_run(request.messages)
         if rounds >= self.soft_limit:
             print(f"🪂 [SOFT-LANDING] 本輪已達 {self.soft_limit} 次工具呼叫，卸除工具強制收尾")
-            # 同輪若多次進來（工具已卸除，理論上不會）由 lessons.py 的 debounce 收斂，
-            # 不在此處用等值判斷——那會在計數跳號時整個漏掉
+            # soft_landing 事件由 Auditor Agent 在 run 結束後分析軌跡識別，不需要在此硬編碼記錄。
             user_id = get_config().get("configurable", {}).get("user_id", DEFAULT_USER_ID)
-            fire_and_forget(record_lesson(request.runtime.store, user_id, "soft_landing"))
             system_message = (
                 f"{request.system_message}\n\n"
                 "【重要｜已達工具使用上限】你不可再呼叫任何工具。請僅根據目前已取得的資訊，"
@@ -536,10 +539,51 @@ class SoftLanding(AgentMiddleware):
         return await handler(request)
 
 
+# 一次移除這麼多樣（含）以上食材才需要人工確認；刪 1~2 樣屬日常操作，直接放行不打斷。
+_INVENTORY_REMOVE_CONFIRM_THRESHOLD = 3
+
+
+def _describe_inventory_remove(tool_call, state, runtime) -> str:
+    items = tool_call["args"].get("items", []) or []
+    return f"確認要從冰箱移除這些食材嗎？（共 {len(items)} 樣）\n{'、'.join(items)}"
+
+
+def _describe_profile_delete(tool_call, state, runtime) -> str:
+    args = tool_call["args"]
+    return f"確認要刪除這筆長期記憶嗎？\naction={args.get('action')} id={args.get('id')}"
+
+
+def _hitl_interrupt_on() -> dict[str, InterruptOnConfig]:
+    """精細版 HITL 設定：只攔真正有風險、不可逆的動作，其餘自動放行。
+
+    設計取捨（對齊前端目前只支援 approve / reject）：
+    - inventory_remove：只有一次刪 >= 門檻樣時才攔（大量刪除較可能是模型誤判）；
+      刪少量屬日常操作，攔了只會反覆打斷使用者。用 when 述詞動態判斷。
+    - 三個 *_profile_manage：只攔 action="delete"（刪既有 profile 才不可逆）；
+      create / update 是累積記憶的正常行為，不需要每次都要求人工確認。
+    """
+    remove_cfg = InterruptOnConfig(
+        allowed_decisions=["approve", "reject"],
+        description=_describe_inventory_remove,
+        when=lambda req: len(req.tool_call["args"].get("items", []) or [])
+        >= _INVENTORY_REMOVE_CONFIRM_THRESHOLD,
+    )
+    profile_delete_cfg = InterruptOnConfig(
+        allowed_decisions=["approve", "reject"],
+        description=_describe_profile_delete,
+        when=lambda req: req.tool_call["args"].get("action") == "delete",
+    )
+    return {
+        "inventory_remove": remove_cfg,
+        "diet_profile_manage": profile_delete_cfg,
+        "kitchen_profile_manage": profile_delete_cfg,
+        "household_profile_manage": profile_delete_cfg,
+    }
+
+
 async def init_agent_infra(
     enable_hitl: bool = True,
     enable_reflection: bool = True,
-    enable_lessons: bool = True,
 ):
     """建立連線池、checkpointer、store 與 agent（須在 event loop 中執行）。
 
@@ -549,13 +593,8 @@ async def init_agent_infra(
     enable_reflection=False 時跳過建立 ReflectionExecutor。後者內部會 spawn 一條
     非 daemon 的 worker 執行緒且永不自動結束，導致主程式跑完仍無法 exit；eval 走
     ainvoke 不觸發反思，故關掉它讓批次跑完能乾淨退出（正式環境一律保持預設 True）。
-
-    enable_lessons=False 時停止記錄與注入教訓記憶（見 lessons.py），供 eval A/B
-    比較「有無教訓注入」的表現差異——否則無從得知這套機制是真有效還是幫倒忙。
     """
     global pool, checkpointer, store, agent
-
-    set_lessons_enabled(enable_lessons)
 
     pool = AsyncConnectionPool(
         conninfo=DB_URI,
@@ -573,6 +612,13 @@ async def init_agent_infra(
 
     _tools_module._guardrail_model = summary_model
     _tools_module._compression_model = summary_model
+
+    # LLM tool router：注入重寫用小模型 + 建立/補齊工具向量索引（冪等，見 tool_index.py）
+    _router_module._rewrite_model = summary_model
+    ensure_index()
+
+    # Auditor Agent：注入 store 與 summary_model，取代舊有的 lessons.py
+    init_auditor(summary_model, store)
 
     if enable_reflection:
         for domain, schema in _PROFILE_DOMAINS.items():
@@ -606,12 +652,8 @@ async def init_agent_infra(
     if enable_hitl:
         middleware.append(
             HumanInTheLoopMiddleware(
-                interrupt_on={
-                    "inventory_remove": True,
-                    "diet_profile_manage": True,
-                    "kitchen_profile_manage": True,
-                    "household_profile_manage": True,
-                },
+                interrupt_on=_hitl_interrupt_on(),
+                description_prefix="此操作會變更你的長期資料，請確認",
             ),
         )
 
@@ -723,6 +765,7 @@ async def _stream_agent(input_data, config):
     thread_id = config.get("configurable", {}).get("thread_id", "")
     recent_calls = _thread_recent_calls.setdefault(thread_id, deque(maxlen=MAX_REPEAT))
     hitl_paused = False  # HITL 中斷時不清除計數，等下次 resume 繼續累計
+    _cognitive_failure_tag: str | None = None  # 認知失敗時寫入 checkpointer 的標籤
 
     try:
         # 機制三：整體超時，asyncio.timeout 需要 async for（astream），同步 stream 會被阻塞
@@ -757,8 +800,17 @@ async def _stream_agent(input_data, config):
                                 recent_calls.append(sig)
                                 if len(recent_calls) == MAX_REPEAT and len(set(recent_calls)) == 1:
                                     print(f"🔁 [REPEAT] {name} 以相同參數連續呼叫 {MAX_REPEAT} 次，強制終止")
-                                    user_id = config.get("configurable", {}).get("user_id", DEFAULT_USER_ID)
-                                    fire_and_forget(record_lesson(store, user_id, "repeat", name))
+                                    _cognitive_failure_tag = f"COGNITIVE_FAILURE:REPEAT:{name}"
+                                    try:
+                                        await agent.aupdate_state(
+                                            config,
+                                            values={"messages": [AIMessage(
+                                                content=f"[{_cognitive_failure_tag}] "
+                                                        f"{name} 以完全相同的參數連續呼叫 {MAX_REPEAT} 次，已被強制中斷。"
+                                            )]},
+                                        )
+                                    except Exception:
+                                        pass
                                     _thread_recent_calls.pop(thread_id, None)
                                     yield f"\n[系統提示：偵測到重複操作（{name} 以相同參數呼叫 {MAX_REPEAT} 次），已自動停止。]\n"
                                     return
@@ -793,21 +845,64 @@ async def _stream_agent(input_data, config):
     # 機制一：步數超限（ModelCallLimitMiddleware 會在剛好第 MAX_STEPS 次 model 呼叫時擋下，
     # 通常先於 recursion_limit 觸發；GraphRecursionError 保留作為最後防線）
     except ModelCallLimitExceededError:
+        _cognitive_failure_tag = "COGNITIVE_FAILURE:STEP_LIMIT"
         print(f"⚠️ [MAX STEPS] 已達 {MAX_STEPS} 次模型呼叫上限")
+        try:
+            await agent.aupdate_state(
+                config,
+                values={"messages": [AIMessage(
+                    content=f"[{_cognitive_failure_tag}] "
+                            f"Agent 在 {MAX_STEPS} 步內未能完成任務，工具呼叫策略可能低效或任務過大。"
+                )]},
+            )
+        except Exception:
+            pass
         yield f"\n[系統提示：已達到最大步數限制（{MAX_STEPS} 步），任務終止。]\n"
 
     except GraphRecursionError:
-        print(f"⚠️ [MAX STEPS] 已達 {MAX_STEPS} 步上限")
+        _cognitive_failure_tag = "COGNITIVE_FAILURE:RECURSION_LIMIT"
+        print(f"⚠️ [MAX STEPS] 已達 {MAX_STEPS} 步上限（遞迴）")
+        try:
+            await agent.aupdate_state(
+                config,
+                values={"messages": [AIMessage(
+                    content=f"[{_cognitive_failure_tag}] "
+                            f"Agent 遞迴深度超過上限，可能陷入工具呼叫死結。"
+                )]},
+            )
+        except Exception:
+            pass
         yield f"\n[系統提示：已達到最大步數限制（{MAX_STEPS} 步），任務終止。]\n"
 
     # 機制三：整體超時
     except asyncio.TimeoutError:
+        _cognitive_failure_tag = "COGNITIVE_FAILURE:TIMEOUT"
         print(f"⏰ [TIMEOUT] 任務超過 {MAX_TIMEOUT} 秒")
+        try:
+            await agent.aupdate_state(
+                config,
+                values={"messages": [AIMessage(
+                    content=f"[{_cognitive_failure_tag}] "
+                            f"Agent 在 {MAX_TIMEOUT} 秒內未能完成任務，可能是外部 API 卡住或任務過於龐大。"
+                )]},
+            )
+        except Exception:
+            pass
         yield f"\n[系統提示：任務執行超過時間限制（{MAX_TIMEOUT} 秒），已自動終止。]\n"
 
     # 最後防線：模型重試 3 次仍失敗、或任何未預期例外，轉成友善訊息而非讓請求裸奔 500
     except Exception as exc:
+        _cognitive_failure_tag = f"UNEXPECTED_ERROR:{type(exc).__name__}"
         print(f"💥 [UNEXPECTED] {type(exc).__name__}: {exc}")
+        try:
+            await agent.aupdate_state(
+                config,
+                values={"messages": [AIMessage(
+                    content=f"[{_cognitive_failure_tag}] 未預期例外：{type(exc).__name__}: {exc}"
+                )]},
+            )
+        except Exception:
+            pass
         yield "\n[系統提示：服務暫時發生問題，請稍後再試。]\n"
 
     finally:
@@ -816,29 +911,19 @@ async def _stream_agent(input_data, config):
             _thread_recent_calls.pop(thread_id, None)
             user_id = config.get("configurable", {}).get("user_id", DEFAULT_USER_ID)
             asyncio.create_task(_run_reflection(thread_id, user_id))
-            fire_and_forget(_check_run_lessons(thread_id, user_id))
-
-
-async def _check_run_lessons(thread_id: str, user_id: str) -> None:
-    """run 結束後檢查整段訊息，補記「只有事後才看得出來」的教訓訊號。
-
-    search_thrash 必須在這裡判定而非 ContextShaping：後者在每次 model 呼叫「之前」
-    執行，只看得到當下已完成的搜尋數，若 run 在最後一次搜尋後就結束（正常收尾或
-    逾時），跨過門檻的那一刻永遠不會被任何一輪看到——實測就是這樣漏掉的。
-    """
-    if not checkpointer:
-        return
-    try:
-        thread_state = await checkpointer.aget({"configurable": {"thread_id": thread_id}})
-        if not thread_state:
-            return
-        messages = (thread_state.get("channel_values") or {}).get("messages", [])
-        distinct = _distinct_searches_this_run(messages)
-        if distinct >= RESEARCH_THRASH_THRESHOLD:
-            print(f"🔍 [SEARCH-THRASH] 本輪換了 {distinct} 種關鍵字重搜")
-            await record_lesson(store, user_id, "search_thrash")
-    except Exception as exc:
-        print(f"⚠️ [LESSON] run 後檢查失敗：{exc}")
+            # Auditor Agent：背景稽核本輪軌跡，提煉防呆規則存入資料庫
+            if checkpointer:
+                try:
+                    thread_state = await checkpointer.aget(
+                        {"configurable": {"thread_id": thread_id}}
+                    )
+                    if thread_state:
+                        channel = thread_state.get("channel_values") or {}
+                        msgs = channel.get("messages", [])
+                        goal = channel.get("original_goal", "")
+                        fire_and_forget(run_auditor(msgs, goal, user_id))
+                except Exception as exc:
+                    print(f"⚠️ [AUDITOR] 取得 checkpointer 狀態失敗：{exc}")
 
 
 async def _run_reflection(thread_id: str, user_id: str) -> None:

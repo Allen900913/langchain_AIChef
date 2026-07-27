@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import InjectedToolCallId, tool
+from langchain_core.tools import InjectedToolCallId, ToolException, tool
 from langchain_tavily import TavilySearch
 
 from langchain.agents.middleware.types import AgentState
@@ -151,12 +151,18 @@ def web_search(query: str) -> str:
         future = _search_executor.submit(_raw_web_search.invoke, query)
         raw = str(future.result(timeout=_SEARCH_TIMEOUT_SECONDS))
     except _FutureTimeoutError:
-        return "<tool_output>\n搜尋逾時，請換個關鍵字或稍後再試。\n</tool_output>"
+        print("⚠️ [web_search] 搜尋逾時")
+        raise ToolException(
+            "[System_Error:TimeoutError] 搜尋逾時。"
+            "請換一組更精確的關鍵字重試，或改用 nutrition_lookup 工具。"
+        )
     except Exception as exc:
-        # Tavily 可能丟網路錯誤 / 401 金鑰錯 / 5xx 等；未接會炸穿工具與整個 run。
-        # 降級成錯誤字串回給模型，由它自行決定換關鍵字或改用其他工具。
-        print(f"⚠️ [web_search] 搜尋失敗：{type(exc).__name__}: {exc}")
-        return "<tool_output>\n搜尋暫時無法使用，請稍後再試或換個說法。\n</tool_output>"
+        error_type = type(exc).__name__
+        print(f"⚠️ [web_search] 搜尋失敗：{error_type}: {exc}")
+        raise ToolException(
+            f"[System_Error:{error_type}] 搜尋失敗：{exc}。"
+            "請換關鍵字或稍後再試。"
+        )
 
     if _guardrail_model is not None:
         try:
@@ -185,6 +191,8 @@ def web_search(query: str) -> str:
     tag = "tool_output"
     return f"<{tag}>\n{_compress_search_result(raw)}\n</{tag}>"
 
+
+web_search.handle_tool_error = True
 
 # ==============================================================================
 # 工具：營養查詢
@@ -383,6 +391,10 @@ diet_profile_manage = create_manage_memory_tool(
                  "⑤ 健康目標（減重/增肌/控糖等）。"
                  "更新時優先修改既有記錄；僅當新資訊與某筆舊記錄直接矛盾且確定過時時，才刪除該筆。",
 )
+# handle_tool_error=True：LangMem 在 action/id 不匹配時會拋 ValueError，
+# 加上此設定後 Exception 會被攔截轉為 ToolMessage 回饋給模型，不會炸穿整個 run。
+diet_profile_manage.handle_tool_error = True
+
 kitchen_profile_manage = create_manage_memory_tool(
     namespace=_profile_ns("kitchen"),
     schema=KitchenProfile,
@@ -390,6 +402,8 @@ kitchen_profile_manage = create_manage_memory_tool(
     instructions="當使用者提到擁有/缺少的廚具、烹飪程度、或願意花的做菜時間時呼叫。"
                  "更新時優先修改既有記錄；僅當新資訊與某筆舊記錄直接矛盾且確定過時時，才刪除該筆。",
 )
+kitchen_profile_manage.handle_tool_error = True
+
 household_profile_manage = create_manage_memory_tool(
     namespace=_profile_ns("household"),
     schema=HouseholdProfile,
@@ -397,6 +411,7 @@ household_profile_manage = create_manage_memory_tool(
     instructions="當使用者提到家庭成員的飲食需求、或平常煮幾人份時呼叫。"
                  "更新時優先修改既有記錄；僅當新資訊與某筆舊記錄直接矛盾且確定過時時，才刪除該筆。",
 )
+household_profile_manage.handle_tool_error = True
 
 
 @tool
