@@ -11,7 +11,8 @@ GCS_BUCKET = os.getenv("GCS_BUCKET")
 
 # 初始化 GCS 客戶端
 # 注意：這裡會自動抓取系統環境變數 GOOGLE_APPLICATION_CREDENTIALS 所指向的 JSON 金鑰路徑
-client = storage.Client()
+def get_gcs_client():
+    return storage.Client()
 
 @router.get("/gcs/presign")
 def chat_endpoint(filename: str):
@@ -27,6 +28,7 @@ def chat_endpoint(filename: str):
     content_type = content_type_map.get(ext, "application/octet-stream")
 
     # 取得 Bucket 與 Blob (檔案物件) 例項
+    client = get_gcs_client()
     bucket = client.bucket(GCS_BUCKET)
     blob = bucket.blob(filename)
 

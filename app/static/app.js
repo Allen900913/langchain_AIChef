@@ -546,29 +546,13 @@ function updateMessageContent(msgEl, content) {
 
 function formatMessage(text) {
   if (!text) return '';
-
-  // Simple markdown-like formatting
-  let html = escapeHtml(text);
-
-  // Code blocks (```)
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
-
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-  // Bold
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-
-  // Italic
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-  // Links
-  html = html.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
-  // Line breaks
-  html = html.replace(/\n/g, '<br>');
-
-  return html;
+  // 使用 marked.js 來解析 Markdown（加上 breaks: true 支援一般換行）
+  try {
+    return marked.parse(text, { breaks: true });
+  } catch (e) {
+    console.error("Markdown parsing error", e);
+    return escapeHtml(text).replace(/\n/g, '<br>');
+  }
 }
 
 function escapeHtml(text) {

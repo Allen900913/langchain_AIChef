@@ -94,9 +94,9 @@ model = init_chat_model(
 )
 
 # 摘要任務（摘要壓縮／web_search 蒸餾／過敏原安全檢查等輕量子任務）換成 Groq 的
-# llama-3.1-8b-instant：延遲極低（TPM 14.4K）、中文與格式遵循實測足夠，且更便宜。
+# llama-3.3-70b-versatile：TPM 12K 更高，且指令遵循能力更好，能避免格式錯誤與 429 限制。
 summary_model = init_chat_model(
-    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
     model_provider="groq",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0,
@@ -181,7 +181,7 @@ system_prompt = """你是一名私人廚師助理，負責管理使用者的冰�
 
 6. 若使用者要學做某道菜的步驟，呼叫 web_search 搜尋食譜後再呼叫 step_tracker_start（只呼叫一次）。呼叫完後，立刻根據工具回傳的第 1 步內容，用自然友善的語氣向使用者說明這一步要做什麼，並告知共幾步。不可在同一輪繼續呼叫 step_tracker_next。
 
-7. 若使用者說「下一步」「然後呢」「第幾步」，只呼叫一次 step_tracker_next，然後停止。呼叫完後，立刻根據工具回傳的內容，用自然友善的語氣向使用者說明這一步的具體做法。不可連續呼叫多次 step_tracker_next。
+7. 若使用者說「下一步」「然後呢」「第幾步」，請只呼叫【一次】 step_tracker_next。取得工具回傳內容後，立刻用自然友善的語氣向使用者說明這一步的做法，然後【結束這回合】。絕對禁止在同一輪對話中連續呼叫第二次 step_tracker_next。
 
 8. 若使用者問缺哪些食材，呼叫 shopping_list_generate。
 
