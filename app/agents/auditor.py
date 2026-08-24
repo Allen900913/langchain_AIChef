@@ -1,17 +1,18 @@
-"""Auditor Agent：Run 結束後背景執行，讀取對話軌跡，找出三大類錯誤，
-並呼叫 save_error_rule 工具把防呆規則寫進資料庫（AsyncPostgresStore）。
+"""Auditor Agent：Run 結束後**有條件地**背景執行，分析 Agent 的行為模式問題，
+並透過 save_error_rule 工具把高價值行為準則寫進資料庫（AsyncPostgresStore）。
 
-三大類錯誤：
-1. 顯性錯誤 (Explicit)  ：ToolMessage 中含有 [System_Error:*] 標籤
-2. 認知失敗 (Cognitive) ：messages 末端含有 [COGNITIVE_FAILURE:*] 標籤（由 _stream_agent 寫入）
-3. 隱性錯誤 (Implicit) ：軌跡完整且無報錯，但邏輯目標未達成（由 LLM 稽核）
+觸發條件（只在以下情況才啟動，非每次 run 都跑）：
+1. 認知失敗：_stream_agent 偵測到 COGNITIVE_FAILURE（重複迴圈、步數耗盡等）
+2. 外部觸發：未來擴充使用者負評等信號
+
+不觸發的情況：
+- 技術故障（API timeout、404 等）：由 ToolException + handle_tool_error 即時處理
+- 正常結束的對話：無需浪費 LLM 成本做稽核
 
 設計原則：
-- 工具化儲存：Auditor Agent 透過 save_error_rule tool 決定什麼時候、存什麼，
-  而非由程式寫死判斷邏輯。
-- 不自建表：底層使用 LangGraph AsyncPostgresStore.aput，namespace=("error_lessons", user_id)，
-  LangGraph 統一管理底層 schema，我們不寫 SQL。
-- 完全取代 lessons.py：原本所有的 record_lesson 呼叫統一由 Auditor Agent 接管。
+- 存入的是「可重複利用的行為準則」，不是系統 log 或技術故障記錄
+- 工具化儲存：Auditor Agent 透過 save_error_rule tool 決定存什麼
+- 底層使用 LangGraph AsyncPostgresStore，namespace=("error_lessons", user_id)
 """
 
 import asyncio
@@ -65,15 +66,17 @@ _DEBOUNCE_SECONDS = 120     # 同一 run 內同一條規則最多累計一次（
 
 @tool
 async def save_error_rule(trigger_condition: str, corrective_action: str) -> str:
-    """當你在軌跡中發現 Agent 有系統性錯誤時，呼叫此工具把防呆規則存入資料庫。
+    """將高價值的行為準則存入資料庫，供未來 Agent 參考避免重蹈覆轍。
+
+    只記錄「可重複利用的行為模式修正」，不記錄一次性技術故障（如 API timeout）。
 
     Args:
-        trigger_condition: 觸發情境的一句話描述，例如
-            「呼叫 web_search 時發生 TimeoutError」
-            「Agent 在達到步數上限時仍在重複呼叫相同的工具」
-        corrective_action: 下次應採取的正確做法，例如
-            「搜尋逾時時請換一組更精確的關鍵字，不要重複相同的搜尋」
-            「若第一次呼叫結果不理想，請改變策略或直接用現有資訊作答」
+        trigger_condition: 觸發情境的一句話描述，聚焦行為模式而非技術細節，例如
+            「Agent 對同一個搜尋 query 反覆呼叫 web_search 且不改變關鍵字」
+            「使用者要求特定料理但 Agent 偏離主題去推薦其他菜式」
+        corrective_action: 下次應採取的正確做法，用「請…」開頭，例如
+            「請在第一次搜尋結果不理想時，改變關鍵字策略或改用其他工具」
+            「請始終以使用者最新的明確請求為優先，避免自行發散」
     """
     if store is None:
         return "❌ Store 尚未初始化，無法儲存規則"
@@ -119,43 +122,51 @@ async def save_error_rule(trigger_condition: str, corrective_action: str) -> str
 # Auditor Agent 提示詞
 # ──────────────────────────────────────────────────────────────
 
-_AUDITOR_SYSTEM = """你是一位 AI 助理的資深稽核員。你的工作是閱讀另一個 AI 的任務執行軌跡，\
-找出它犯的錯誤，並透過工具把防呆規則寫進資料庫。
+_AUDITOR_SYSTEM = """你是一位 AI 助理的行為稽核員。你的工作是閱讀另一個 AI 的任務執行軌跡，\
+找出它的「行為模式問題」，並透過工具把可重複利用的行為準則寫進資料庫。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-錯誤分類與辨識方式
+你的稽核範圍（只關注以下兩類問題）
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-① 顯性錯誤（Explicit Error）
-   辨識方法：ToolMessage 中含有 [System_Error:*] 標籤。
-   代表意義：工具呼叫發生了系統層面的失敗（逾時、API 錯誤、參數不合法等）。
-   你需要記錄：什麼情境觸發了這個錯誤？下次 Agent 應該如何避免或修正？
+① 重複行為迴圈
+   辨識方法：軌跡中出現 [COGNITIVE_FAILURE:REPEAT:*] 標籤。
+   代表意義：Agent 以完全相同的參數反覆呼叫同一個工具，陷入死迴圈。
+   你需要提煉：是什麼任務情境導致了這個迴圈？Agent 應該如何提早辨識
+   並切換策略（例如換關鍵字、改用其他工具、或直接用現有資訊作答）？
 
-② 認知失敗（Cognitive Failure）
-   辨識方法：軌跡末尾的 AIMessage 含有 [COGNITIVE_FAILURE:*] 標籤，例如
-   [COGNITIVE_FAILURE:TIMEOUT]、[COGNITIVE_FAILURE:STEP_LIMIT]、[COGNITIVE_FAILURE:REPEAT]。
-   代表意義：Agent 陷入死結、步數用盡、或無限迴圈。
-   你需要記錄：是什麼任務模式導致了這個失敗？如何提早識別並放棄？
+② 隱性行為偏差（僅限有強烈證據時）
+   辨識方法：軌跡中無技術報錯，但最終回覆與任務目標「嚴重且明顯」不符。
+   注意：以下情況「不算」錯誤，請直接 PASS：
+   - 助理用不同方式（如直接說明而非啟動 step_tracker）完成了任務 → 正常
+   - 助理在回覆末尾主動提供額外建議或延伸資訊 → 正常
+   - 搜尋結果不夠完美但助理已盡力 → 正常
+   只有以下情況才算隱性錯誤：
+   - 使用者明確提到過敏原/限制，但最終推薦完全忽略
+   - 在無任何工具佐證的情況下，編造了具體的數字或步驟
+   - 完全答非所問（使用者問 A，助理答 B，且 B 與 A 無關）
 
-③ 隱性錯誤（Implicit Error）
-   辨識方法：程式沒有報錯（無 [System_Error] 也無 [COGNITIVE_FAILURE]），
-   但最終回覆與任務目標明顯不符。常見模式：
-   - 空值誤判：工具回傳空結果，但助理就此斷定「沒有資料」而非確認
-   - 目標漂移：最終回覆沒有真正解決使用者的原始問題
-   - 虛構資訊：在無工具佐證的情況下，編造了具體的烹飪時間或步驟
-   - 遺漏約束：使用者提到的限制（過敏原、不辣等）在最終推薦中被忽略
+━━━━━━━━━━━━━━━━━━━━━━━━
+不在你的稽核範圍（請忽略）
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+- 技術故障（API timeout、搜尋失敗等）：這些是暫態問題，Agent 已透過錯誤訊息
+  即時處理，不需要你記錄為行為準則。
+- 步數耗盡（STEP_LIMIT）或整體逾時（TIMEOUT）：這些是系統保護機制觸發，
+  不代表 Agent 有行為問題。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 你的行動指南
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. 仔細閱讀下方的任務目標與執行軌跡。
-2. 若助理表現完美，沒有以上任何一類錯誤：直接回答 "PASS"，不要呼叫工具。
-3. 若發現錯誤：呼叫 save_error_rule 工具，一次記錄一條規則。
-   - trigger_condition 要精確描述「是什麼情境」，讓未來的 Agent 知道這條規則何時適用。
-   - corrective_action 要具體說明「應該怎麼做」，用「請…」開頭，避免「不要…」。
-   - 同一份軌跡最多呼叫 3 次（避免過度提煉偶發事件）。
-4. 只記錄你有充分軌跡證據的錯誤，不要臆測。"""
+1. 仔細閱讀下方的觸發原因、任務目標與執行軌跡。
+2. 若助理行為合理（即使結果不完美），直接回答 "PASS"，不要呼叫工具。
+   寧可漏判也不要誤判——錯誤的規則比沒有規則更有害。
+3. 若發現明確的行為模式問題：呼叫 save_error_rule 工具，一次記錄一條準則。
+   - trigger_condition：描述「行為模式」而非技術細節。
+   - corrective_action：具體說明「應該怎麼做」，用「請…」開頭。
+   - 同一份軌跡最多呼叫 2 次。
+4. 只記錄你有充分軌跡證據的問題，不要臆測。有疑問時一律 PASS。"""
 
 # executor 在 init_auditor 時建立（需要 summary_model 已初始化）
 _auditor_executor = None
@@ -219,43 +230,53 @@ def format_trajectory(messages: list) -> str:
     return "\n".join(lines)
 
 
-def _should_audit(messages: list, goal: str) -> bool:
-    """判斷本輪是否值得啟動稽核（成本控制：閒聊不稽核）。
+def _should_audit(messages: list, goal: str, trigger_reason: str | None = None) -> bool:
+    """判斷本輪是否值得啟動稽核。
 
-    條件：
-    1. 本輪有工具呼叫（純閒聊對話不存在可稽核的行為）
-    2. 有任務目標 original_goal（無目標就無法判斷「漂移」）
-    3. 工具呼叫次數 >= 2（單次查詢偶發錯誤不值得提煉為模式）
+    觸發條件（任一滿足即觸發）：
+    1. 外部明確觸發（trigger_reason 非 None）：如 COGNITIVE_FAILURE 或未來的使用者負評
+    2. 未來擴充：可加入抽樣率等機制
+
+    不觸發的情況：
+    - 正常結束的對話（無 trigger_reason）
+    - 技術故障（API timeout 等，由 ToolException 即時處理）
     """
-    run_msgs = _this_run_messages(messages)
-    tool_call_rounds = sum(
-        1 for m in run_msgs
-        if isinstance(m, AIMessage) and m.tool_calls
-    )
-    return bool(goal) and tool_call_rounds >= 2
+    # 有明確觸發原因就跑
+    if trigger_reason:
+        return bool(goal)
+    # 沒有觸發原因 = 正常結束，不跑 Auditor
+    return False
 
 
 # ──────────────────────────────────────────────────────────────
 # 主入口：run_auditor
 # ──────────────────────────────────────────────────────────────
 
-async def run_auditor(messages: list, goal: str, user_id: str) -> None:
+async def run_auditor(
+    messages: list,
+    goal: str,
+    user_id: str,
+    trigger_reason: str | None = None,
+) -> None:
     """背景執行的 Auditor Agent 主入口。
 
     由 app.py 的 _stream_agent finally 區塊透過 fire_and_forget 呼叫。
+    只在有明確觸發原因時才啟動稽核，正常結束的對話不觸發。
     失敗時只打 print，不影響主流程。
 
     Args:
-        messages: 從 checkpointer 讀取的完整訊息歷史
-        goal:     本輪任務的 original_goal（來自 ChefState）
-        user_id:  用於 Store namespace 定位
+        messages:       從 checkpointer 讀取的完整訊息歷史
+        goal:           本輪任務的 original_goal（來自 ChefState）
+        user_id:        用於 Store namespace 定位
+        trigger_reason: 觸發原因（如 'COGNITIVE_FAILURE:REPEAT:web_search'）。
+                        None 表示正常結束，不觸發稽核。
     """
     if _auditor_executor is None:
         print("⚠️ [AUDITOR] Executor 尚未初始化，跳過稽核")
         return
 
-    if not _should_audit(messages, goal):
-        return  # 靜默跳過，不打 log（閒聊太頻繁會洗版）
+    if not _should_audit(messages, goal, trigger_reason):
+        return  # 正常結束，不需要稽核
 
     trajectory = format_trajectory(messages)
     if not trajectory.strip():
@@ -265,12 +286,16 @@ async def run_auditor(messages: list, goal: str, user_id: str) -> None:
     token = _current_user_id.set(user_id)
     try:
         goal_str = goal or "（使用者未設定明確任務目標）"
+        reason_str = trigger_reason or "未知"
+        print(f"📓 [AUDITOR] 啟動稽核（原因：{reason_str}）")
         await _auditor_executor.ainvoke({
             "messages": [
                 HumanMessage(content=(
+                    f"【觸發原因】\n{reason_str}\n\n"
                     f"【任務目標】\n{goal_str}\n\n"
                     f"【執行軌跡】\n{trajectory}\n\n"
-                    "請開始稽核。若有錯誤，呼叫 save_error_rule 工具記錄。若沒有，直接回答 PASS。"
+                    "請開始稽核。若發現行為模式問題，呼叫 save_error_rule 工具記錄準則。"
+                    "若行為合理，直接回答 PASS。"
                 ))
             ]
         })

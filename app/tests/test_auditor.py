@@ -18,11 +18,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-# Windows UTF-8 修復
-for _s in (sys.stdout, sys.stderr):
-    if _s and getattr(_s, "encoding", None) != "utf-8":
-        try: _s.reconfigure(encoding="utf-8")
-        except: pass
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -93,7 +90,7 @@ async def main():
     await store.setup()
 
     summary_model = init_chat_model(
-        "llama-3.1-8b-instant",
+        "openai/gpt-oss-20b",
         model_provider="groq",
         api_key=os.getenv("GROQ_API_KEY"),
         temperature=0,
@@ -218,13 +215,12 @@ async def main():
               f"actual: {rules[0][:60]}")
 
     # ==================================================================
-    # 測試 4：format_trajectory 與 _should_audit
+    # 測試 4：format_trajectory 與 _should_audit 觸發邏輯
     # ==================================================================
     print("\n" + "─" * 60)
-    print("🔬 測試 4：format_trajectory 與 _should_audit")
+    print("🔬 測試 4：format_trajectory 與 _should_audit 觸發邏輯")
     print("─" * 60)
 
-    # 模擬一段有工具呼叫的軌跡
     mock_messages = [
         HumanMessage(content="幫我推薦低卡料理"),
         AIMessage(content="", tool_calls=[
@@ -244,23 +240,31 @@ async def main():
     trajectory = format_trajectory(mock_messages)
     print(f"  軌跡長度: {len(trajectory)} 字")
     check("軌跡非空", len(trajectory) > 0)
-    check("軌跡包含 [System_Error]", "System_Error" in trajectory, trajectory[:200])
     check("軌跡包含工具呼叫記錄", "web_search" in trajectory)
 
-    should = _should_audit(mock_messages, "推薦低卡料理")
-    check("_should_audit 判定為 True（有目標 + ≥2 次工具呼叫）", should)
+    # 1. 正常結束 / 技術錯誤（無 trigger_reason）→ 不應觸發
+    should_normal = _should_audit(mock_messages, "推薦低卡料理", trigger_reason=None)
+    check("正常對話 / 技術錯誤 (trigger_reason=None) -> 不觸發 (_should_audit == False)", not should_normal)
 
-    no_goal = _should_audit(mock_messages, "")
-    check("_should_audit 無目標時為 False", not no_goal)
+    # 2. 認知失敗（有 trigger_reason）→ 應觸發
+    should_repeat = _should_audit(mock_messages, "推薦低卡料理", trigger_reason="COGNITIVE_FAILURE:REPEAT:web_search")
+    check("重複迴圈失敗 (trigger_reason='COGNITIVE_FAILURE:REPEAT:web_search') -> 觸發 (_should_audit == True)", should_repeat)
+
+    # 3. 外部觸發 / 使用者負評 (trigger_reason='user_negative_feedback') -> 應觸發
+    should_feedback = _should_audit(mock_messages, "推薦低卡料理", trigger_reason="user_negative_feedback")
+    check("使用者負評等外部信號 -> 觸發 (_should_audit == True)", should_feedback)
+
+    # 4. 若無任務目標（goal 為空），即使有 trigger_reason 也不觸發
+    no_goal = _should_audit(mock_messages, "", trigger_reason="COGNITIVE_FAILURE:REPEAT:web_search")
+    check("無目標時 (goal='') -> 不觸發", not no_goal)
 
     # ==================================================================
-    # 測試 5：Auditor Agent 完整執行（LLM 分析軌跡 + 呼叫工具）
+    # 測試 5：Auditor Agent 完整執行驗證（正常不觸發 vs REPEAT 觸發寫入）
     # ==================================================================
     print("\n" + "─" * 60)
-    print("🔬 測試 5：Auditor Agent 完整執行（LLM 分析含錯誤的軌跡）")
+    print("🔬 測試 5：Auditor Agent 完整執行（正常不觸發 vs REPEAT 觸發寫入）")
     print("─" * 60)
 
-    # 先清理，用一個獨特的 user_id 避免被之前測試干擾
     TEST_USER_AGENT = "__test_auditor_agent__"
     agent_ns = ("error_lessons", TEST_USER_AGENT)
     try:
@@ -270,7 +274,14 @@ async def main():
     except:
         pass
 
-    # 構造一段明顯有錯誤的軌跡（連續搜尋逾時 + 認知失敗標籤）
+    # 5A. 測試情境一：正常結束的對話（即使發生過一次逾時技術錯誤）
+    print("  [5A] 測試正常結束對話（trigger_reason=None）...")
+    await run_auditor(mock_messages, "推薦低卡料理", TEST_USER_AGENT, trigger_reason=None)
+    await asyncio.sleep(0.5)
+    items_normal = list(await store.asearch(agent_ns))
+    check("正常對話 (trigger_reason=None) -> Auditor 不執行，Store 無寫入", len(items_normal) == 0, f"實際寫入: {len(items_normal)}")
+
+    # 5B. 測試情境二：偵測到 REPEAT 迴圈失敗，帶入 trigger_reason
     error_messages = [
         HumanMessage(content="幫我找減脂雞胸肉食譜"),
         AIMessage(content="", tool_calls=[
@@ -287,28 +298,36 @@ async def main():
             content="[System_Error:TimeoutError] 搜尋逾時。請換一組更精確的關鍵字重試。",
             tool_call_id="tc2", name="web_search"
         ),
+        AIMessage(content="", tool_calls=[
+            {"name": "web_search", "args": {"query": "減脂雞胸肉食譜"}, "id": "tc3", "type": "tool_call"}
+        ]),
+        ToolMessage(
+            content="[System_Error:TimeoutError] 搜尋逾時。請換一組更精確的關鍵字重試。",
+            tool_call_id="tc3", name="web_search"
+        ),
         AIMessage(content="[COGNITIVE_FAILURE:REPEAT:web_search] web_search 以完全相同的參數連續呼叫 3 次，已被強制中斷。"),
     ]
 
-    print("  正在執行 Auditor Agent（呼叫 LLM 分析軌跡）...")
-    await run_auditor(error_messages, "找減脂雞胸肉食譜", TEST_USER_AGENT)
-    print("  Auditor Agent 執行完畢")
+    print("\n  [5B] 測試 REPEAT 迴圈（trigger_reason='COGNITIVE_FAILURE:REPEAT:web_search'）...")
+    await run_auditor(
+        error_messages,
+        "找減脂雞胸肉食譜",
+        TEST_USER_AGENT,
+        trigger_reason="COGNITIVE_FAILURE:REPEAT:web_search",
+    )
+    print("  Auditor Agent 執行完畢，檢查 Store 記錄...")
 
-    # 等一下讓背景任務完成
     await asyncio.sleep(1)
 
-    # 檢查是否有寫入
-    items = await store.asearch(agent_ns)
-    rules_written = list(items)
-    print(f"  Auditor Agent 寫入了 {len(rules_written)} 條規則:")
-    for it in rules_written:
+    items_repeat = list(await store.asearch(agent_ns))
+    print(f"  Auditor Agent 寫入了 {len(items_repeat)} 條規則:")
+    for it in items_repeat:
         v = it.value
-        print(f"    → 情境: {v.get('trigger_condition', '?')}")
-        print(f"      做法: {v.get('corrective_action', '?')}")
+        print(f"    → 情境 (trigger_condition): {v.get('trigger_condition', '?')}")
+        print(f"      準則 (corrective_action): {v.get('corrective_action', '?')}")
         print(f"      hits: {v.get('hits', '?')}")
 
-    check("Auditor Agent 至少寫入 1 條規則", len(rules_written) >= 1,
-          f"寫入了 {len(rules_written)} 條")
+    check("REPEAT 觸發 -> Auditor Agent 成功分析並寫入行為準則", len(items_repeat) >= 1, f"寫入了 {len(items_repeat)} 條")
 
     # ==================================================================
     # 測試 6：System Prompt 注入格式

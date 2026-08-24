@@ -1,21 +1,34 @@
 import os
 from datetime import timedelta
-from fastapi import APIRouter
+
+from fastapi import APIRouter, HTTPException
 from google.cloud import storage
 
-# /api/v1
 router = APIRouter()
 
-# 從環境變數獲取你的 Bucket 名稱
-GCS_BUCKET = os.getenv("GCS_BUCKET")
 
-# 初始化 GCS 客戶端
-# 注意：這裡會自動抓取系統環境變數 GOOGLE_APPLICATION_CREDENTIALS 所指向的 JSON 金鑰路徑
-def get_gcs_client():
+def get_gcs_client() -> storage.Client:
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if cred_path:
+        # 若為相對路徑，轉為相對於專案根目錄的絕對路徑
+        if not os.path.isabs(cred_path):
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+            candidate = os.path.join(base_dir, cred_path)
+            if os.path.exists(candidate):
+                cred_path = candidate
+        if os.path.exists(cred_path):
+            return storage.Client.from_service_account_json(cred_path)
     return storage.Client()
+
 
 @router.get("/gcs/presign")
 def chat_endpoint(filename: str):
+    gcs_bucket = os.getenv("GCS_BUCKET")
+    if not gcs_bucket:
+        raise HTTPException(
+            status_code=500,
+            detail="GCS_BUCKET 環境變數尚未設定，請在 .env 中填寫 GCS Bucket 名稱",
+        )
     # 根據檔案副檔名判斷 Content-Type
     content_type_map = {
         "jpg": "image/jpeg",
@@ -29,7 +42,7 @@ def chat_endpoint(filename: str):
 
     # 取得 Bucket 與 Blob (檔案物件) 例項
     client = get_gcs_client()
-    bucket = client.bucket(GCS_BUCKET)
+    bucket = client.bucket(gcs_bucket)
     blob = bucket.blob(filename)
 
     # 產生預先簽名的上傳 URL (PUT 請求)

@@ -11,9 +11,11 @@ wheels/
 
 # Secrets
 .env
-app/rugged-choir-455105-b2-9e87e2065111.json
+app/rugged-choir-*.json
+*.json.secret
 *-key.json
 *service-account*.json
+app/*-b2-*.json
 
 # Logs
 *.log

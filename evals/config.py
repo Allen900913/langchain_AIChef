@@ -30,7 +30,7 @@ if "langchain_community.chat_models.vertexai" not in sys.modules:
 from openai import AsyncOpenAI  # noqa: E402
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY = os.getenv("NVIDA_API_KEY")  # 註：env 變數名沿用專案既有拼字 NVIDA_API_KEY
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY") or os.getenv("NVIDA_API_KEY")
 
 # judge：受測 agent 用 qwen3-next-80b，這裡刻意換不同模型避免自己改自己考卷
 JUDGE_MODEL = "meta/llama-3.3-70b-instruct"

@@ -85,7 +85,7 @@ model = init_chat_model(
     # id（實測 2/2 皆如此，非偶發），導致 LangMem 直接拋 ValueError 炸穿整個
     # run。改用 NVIDIA NIM 代管的同一顆 gpt-oss-120b（見 deepsearch/agent.py 已
     # 驗證過的 agentic tool-calling 穩定性）。
-    api_key=os.getenv("NVIDA_API_KEY"),
+    api_key=os.getenv("NVIDIA_API_KEY"),
     temperature=0,
     request_timeout=50.0,
     max_retries=3,
@@ -93,10 +93,10 @@ model = init_chat_model(
     presence_penalty=0.3,
 )
 
-# 摘要任務（摘要壓縮／web_search 蒸餾／過敏原安全檢查等輕量子任務）換成 Groq 的
-# llama-3.3-70b-versatile：TPM 12K 更高，且指令遵循能力更好，能避免格式錯誤與 429 限制。
+# 摘要任務（摘要壓縮／web_search 蒸餾／過敏原安全檢查等輕量子任務）使用 Groq 的 openai/gpt-oss-20b：
+# 延遲低、便宜，指令遵循穩定。
 summary_model = init_chat_model(
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
     model_provider="groq",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0,
@@ -911,7 +911,8 @@ async def _stream_agent(input_data, config):
             _thread_recent_calls.pop(thread_id, None)
             user_id = config.get("configurable", {}).get("user_id", DEFAULT_USER_ID)
             asyncio.create_task(_run_reflection(thread_id, user_id))
-            # Auditor Agent：背景稽核本輪軌跡，提煉防呆規則存入資料庫
+            # Auditor Agent：只在偵測到行為問題（如 COGNITIVE_FAILURE）時才觸發
+            # 正常結束的對話 _cognitive_failure_tag 為 None，Auditor 不會啟動
             if checkpointer:
                 try:
                     thread_state = await checkpointer.aget(
@@ -921,7 +922,10 @@ async def _stream_agent(input_data, config):
                         channel = thread_state.get("channel_values") or {}
                         msgs = channel.get("messages", [])
                         goal = channel.get("original_goal", "")
-                        fire_and_forget(run_auditor(msgs, goal, user_id))
+                        fire_and_forget(run_auditor(
+                            msgs, goal, user_id,
+                            trigger_reason=_cognitive_failure_tag,
+                        ))
                 except Exception as exc:
                     print(f"⚠️ [AUDITOR] 取得 checkpointer 狀態失敗：{exc}")
 
