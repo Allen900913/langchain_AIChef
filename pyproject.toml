@@ -23,9 +23,15 @@ dependencies = [
     "deepagents>=0.6.12",
     "markdown-it-py>=4.2.0",
     "qdrant-client[fastembed]>=1.18.0",
+    "langfuse>=4.15.1",
 ]
 
 [dependency-groups]
 eval = [
     "ragas>=0.4.3",
+    # evals/config.py 直接 import 這兩個（langchain_community 的 vertexai shim、
+    # AsyncOpenAI judge client）。雖然 ragas 會間接帶進來，但直接 import 就要直接宣告，
+    # 否則 ragas 換版本拿掉相依時會在新機器上直接炸掉。
+    "langchain-community>=0.4.2",
+    "openai>=2.0.0",
 ]

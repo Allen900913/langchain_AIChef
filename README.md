@@ -56,7 +56,7 @@ HITL 中斷時回傳 `{"type":"interrupt","action_requests":[...]}`，前端要�
 |---|---|---|---|
 | `model` | 主 ReAct agent，tool-calling 對話 | NVIDIA NIM `openai/gpt-oss-120b` | 實測 Groq 版本（`llama-3.3-70b-versatile`／`openai/gpt-oss-120b`）皆有各自的 tool-calling 穩定性問題，見下方「模型選型記錄」 |
 | `summary_model` | 摘要壓縮／web_search 蒸餾／過敏原安全判定等輕量子任務 | Groq `llama-3.1-8b-instant` | 延遲低、便宜，未觀察到問題 |
-| `vision_model` | 圖片辨識（僅描述食材，不掛任何工具） | Groq `qwen/qwen3.6-27b` | Groq 上唯一支援圖片輸入的模型；回覆含 `<think>...</think>` 推理區塊需自行濾除 |
+| `vision_model` | 圖片辨識（僅描述食材，不掛任何工具） | Groq `qwen/qwen3.8-27b` | Groq 上唯一支援圖片輸入的模型；回覆含 `<think>...</think>` 推理區塊需自行濾除 |
 
 **Vision 與 tool-calling 解耦**：`call_agent` 收到圖片時，先用 `vision_model` 單次 `ainvoke`
 把圖片轉成純文字食材描述（`_describe_image()`），再包進 `<tool_output>` 標籤跟隨純文字訊息一起
@@ -202,7 +202,63 @@ run 失敗。
 
 ## 環境變數
 
-`DB_URI`（Postgres 連線字串）、`GROQ_API_KEY`（Groq，`summary_model`／`vision_model` 用）、
-`NVIDA_API_KEY`（NVIDIA NIM，主模型 `model` 用，注意變數名拼寫）、
-`TAVILY_API_KEY`（`web_search` 用）、
-`GCS_BUCKET` + `GOOGLE_APPLICATION_CREDENTIALS`（`oss.py` 用）。
+程式實際會讀到的變數（`.env` 不進版控，換機器要自己帶過去）：
+
+| 變數 | 誰在用 | 必要性 |
+|---|---|---|
+| `DB_URI` | Postgres checkpointer / long-term store | 必要，對應 docker-compose 的 `5435` port |
+| `NVIDIA_API_KEY` | `agents/app.py` 主模型 `model`（NVIDIA NIM） | 必要 |
+| `GROQ_API_KEY` | `summary_model`／`vision_model` | 必要 |
+| `TAVILY_API_KEY` | `web_search`（由 `langchain_tavily` SDK 自己讀） | 必要 |
+| `QDRANT_URL` | `agents/tool_index.py` 工具檢索 | 必要，預設 `http://localhost:6333` |
+| `GCS_BUCKET`、`GOOGLE_APPLICATION_CREDENTIALS` | `api/v1/oss.py` 預簽名 URL | 用到圖片上傳才需要 |
+| `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` | trace + `agents/prompt_manager.py` | 選用，沒設就走本地 fallback prompt |
+
+注意：`test_guardrail.py` 讀的是拼錯的 `NVIDA_API_KEY`（少一個 I），`.env` 裡是正確的
+`NVIDIA_API_KEY`，所以那支測試的 Part B 會自動略過。`evals/config.py` 兩個名字都吃。
+
+## 換機器 / 重新部署步驟
+
+1. **先決條件**：Python 3.12（見 `.python-version`）、[uv](https://docs.astral.sh/uv/)、Docker Desktop。
+2. **手動帶過去的檔案**（都在 `.gitignore` 裡，git clone 不會有）：
+   - `.env`
+   - `app/rugged-choir-*.json`（GCS service account 金鑰，`GOOGLE_APPLICATION_CREDENTIALS` 指向它）
+3. **裝套件**：
+   ```bash
+   uv sync                 # 主程式
+   uv sync --group eval    # 要跑 evals/ 才需要，會多裝 ragas 那一票
+   ```
+4. **起依賴服務**：
+   ```bash
+   docker compose up -d    # postgres(5435) + qdrant(6333)
+   ```
+5. **Langfuse 要另外用 git 拉官方 repo 部署**，本專案的 `docker-compose.yml` 只留 volume 宣告、
+   不含 langfuse 服務定義（細節見下一節）。
+6. **啟動**：`uv run uvicorn app.main:app --reload --port 8001`，開 `http://127.0.0.1:8001`
+   （`main.py` 的 `__main__` 也寫死 8001，直接 `uv run python -m app.main` 亦可）。
+
+資料搬移備註：
+- Qdrant 的 `chef_tools` collection 由 `tool_index.py` 在啟動時自動建好，**不用手動搬**。
+- Postgres 裡的對話 checkpoint 與長期記憶**不會跟著 git 走**（存在 docker volume）。要保留舊對話
+  就自己 `pg_dump` 再 restore；不在意就直接空的重新開始。
+
+## Langfuse 部署（用 git 抓官方 repo 就好）
+
+**不要**把 langfuse 的服務塞進本專案的 `docker-compose.yml`。langfuse 自己那套（web、worker、
+postgres、clickhouse、redis、minio）版本相依很緊，直接用官方 repo 起最省事：
+
+```bash
+git clone https://github.com/langfuse/langfuse.git
+cd langfuse
+docker compose up -d
+```
+
+起來後開 `http://localhost:3000` 建帳號 → 建 project → 拿 public/secret key 填回本專案 `.env` 的
+`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`，`LANGFUSE_BASE_URL` 設 `http://localhost:3000`。
+
+本專案 `docker-compose.yml` 底部保留的 `langfuse_*` volume 宣告只是歷史殘留（當初曾把 langfuse
+寫在同一份 compose 裡），沒有服務在用，留著不影響運作。
+
+Prompt 管理是選用的：`agents/prompt_manager.py` 會去 langfuse 抓 `chef_system_prompt` 等 7 個
+prompt，抓不到（沒設 key／服務沒起／prompt 還沒建）就自動用檔案裡的 `DEFAULT_*` fallback，
+不會讓 app 掛掉。所以新機器上就算先不部署 langfuse，程式一樣跑得起來。

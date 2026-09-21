@@ -1,6 +1,7 @@
-version: '3.8'
-
 services:
+  # ==============================================================
+  # AI Chef 既有服務（保持不動）
+  # ==============================================================
   postgres:
     image: postgres:15
     container_name: postgres-ai-chef
@@ -9,7 +10,7 @@ services:
       POSTGRES_PASSWORD: zxcv65428
       POSTGRES_DB: ai_memory
     ports:
-      - "5432:5432"
+      - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -27,3 +28,11 @@ services:
 volumes:
   postgres_data:
   qdrant_data:
+  # 以下 langfuse_* volume 是歷史殘留：langfuse 請改用官方 repo 部署
+  #   git clone https://github.com/langfuse/langfuse.git && cd langfuse && docker compose up -d
+  # 不要把 langfuse 的服務寫回這份 compose，版本相依很容易撞。
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_redis_data:
+  langfuse_minio_data:
