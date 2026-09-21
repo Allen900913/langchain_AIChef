@@ -56,7 +56,7 @@ HITL 中斷時回傳 `{"type":"interrupt","action_requests":[...]}`，前端要�
 |---|---|---|---|
 | `model` | 主 ReAct agent，tool-calling 對話 | NVIDIA NIM `openai/gpt-oss-120b` | 實測 Groq 版本（`llama-3.3-70b-versatile`／`openai/gpt-oss-120b`）皆有各自的 tool-calling 穩定性問題，見下方「模型選型記錄」 |
 | `summary_model` | 摘要壓縮／web_search 蒸餾／過敏原安全判定等輕量子任務 | Groq `llama-3.1-8b-instant` | 延遲低、便宜，未觀察到問題 |
-| `vision_model` | 圖片辨識（僅描述食材，不掛任何工具） | Groq `qwen/qwen3.6-27b` | Groq 上唯一支援圖片輸入的模型；回覆含 `<think>...</think>` 推理區塊需自行濾除 |
+| `vision_model` | 圖片辨識（僅描述食材，不掛任何工具） | Groq `qwen/qwen3.8-27b` | Groq 上唯一支援圖片輸入的模型；回覆含 `<think>...</think>` 推理區塊需自行濾除 |
 
 **Vision 與 tool-calling 解耦**：`call_agent` 收到圖片時，先用 `vision_model` 單次 `ainvoke`
 把圖片轉成純文字食材描述（`_describe_image()`），再包進 `<tool_output>` 標籤跟隨純文字訊息一起

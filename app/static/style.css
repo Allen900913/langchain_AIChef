@@ -940,51 +940,400 @@ body {
   opacity: 0.5;
 }
 
-/* --- HITL 審核卡片 --- */
-.hitl-tool {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 13px;
+/* =============================================
+   Tool Activity Card (工具執行歷程思考卡片)
+   ============================================= */
+
+.tool-activity-card {
+  margin: 6px 0 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
+}
+
+.tool-activity-card:hover {
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow-glow);
+}
+
+.tool-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
   background: var(--bg-tertiary);
-  border: 1px solid var(--bg-hover);
-  border-radius: 8px;
-  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid transparent;
+  transition: background var(--transition-fast);
+}
+
+.tool-activity-card.expanded .tool-card-header {
+  border-bottom-color: var(--border-secondary);
+}
+
+.tool-card-header:hover {
+  background: var(--bg-hover);
+}
+
+.tool-card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-accent);
+}
+
+.tool-status-icon {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tool-status-icon.pulse-dot {
+  background: #a855f7;
+  box-shadow: 0 0 10px #a855f7;
+  animation: pulseGlow 1.5s infinite ease-in-out;
+}
+
+.tool-status-icon.check-dot {
+  background: #10b981;
+  box-shadow: 0 0 8px #10b981;
+}
+
+@keyframes pulseGlow {
+  0%, 100% {
+    transform: scale(0.9);
+    opacity: 0.7;
+    box-shadow: 0 0 4px #a855f7;
+  }
+  50% {
+    transform: scale(1.3);
+    opacity: 1;
+    box-shadow: 0 0 12px #a855f7, 0 0 20px #ec4899;
+  }
+}
+
+.tool-card-toggle {
+  background: rgba(108, 92, 231, 0.12);
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.tool-card-header:hover .tool-card-toggle {
+  background: rgba(108, 92, 231, 0.25);
+  color: var(--text-primary);
+}
+
+.tool-card-body {
+  display: none;
+  padding: 10px 14px;
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-activity-card:not(.expanded) .tool-card-body {
+  display: none;
+}
+
+.tool-item {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 13px;
+  transition: all var(--transition-fast);
+}
+
+.tool-item.status-running {
+  border-color: rgba(168, 85, 247, 0.35);
+  background: linear-gradient(135deg, rgba(168, 85, 247, 0.05), var(--bg-tertiary));
+}
+
+.tool-item.status-success {
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.tool-item.status-error {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.04);
+}
+
+.tool-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tool-item-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.tool-item-icon {
+  font-size: 15px;
+}
+
+.tool-item-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.badge-running {
+  background: rgba(168, 85, 247, 0.18);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.badge-success {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.badge-error {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.spinner-small {
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.tool-item-args, .tool-item-result {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.args-label, .result-label {
+  font-weight: 600;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  margin-bottom: 2px;
+  display: block;
+}
+
+.tool-item-args code {
+  display: block;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 6px 10px;
+  border-radius: 4px;
+  color: var(--text-accent);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.tool-item-result pre {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin: 0;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.tool-item-result code {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+
+/* =============================================
+   Status Banners (系統狀態與告警橫幅)
+   ============================================= */
+
+.status-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
   margin: 8px 0;
+  font-size: 13px;
+  line-height: 1.5;
+  animation: fadeInUp 0.3s ease;
+}
+
+.banner-warning {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(217, 119, 6, 0.05));
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: #fbbf24;
+}
+
+.banner-error {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(185, 28, 28, 0.05));
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+}
+
+.banner-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+
+/* =============================================
+   HITL 授權審核卡片 (Enhanced HITL Action Card)
+   ============================================= */
+
+.hitl-card {
+  background: linear-gradient(145deg, rgba(30, 27, 75, 0.7), rgba(22, 22, 31, 0.9));
+  border: 1px solid rgba(168, 85, 247, 0.4);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  margin: 12px 0;
+  box-shadow: 0 8px 30px rgba(108, 92, 231, 0.2);
+  animation: fadeInUp 0.35s ease;
+}
+
+.hitl-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.hitl-card-icon {
+  font-size: 20px;
+}
+
+.hitl-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-accent);
+  background: var(--gradient-primary);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hitl-card-desc {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.hitl-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.hitl-tool {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  background: rgba(10, 10, 15, 0.6);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  color: var(--text-primary);
   word-break: break-all;
 }
 
 .hitl-actions {
   display: flex;
   gap: 12px;
-  margin-top: 12px;
 }
 
 .hitl-btn {
   flex: 1;
   padding: 10px 16px;
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.15s, transform 0.1s;
-}
-
-.hitl-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  opacity: 0.9;
-}
-
-.hitl-btn:disabled {
-  opacity: 0.55;
-  cursor: default;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all var(--transition-fast);
 }
 
 .hitl-approve {
-  background: #16a34a;
-  color: #fff;
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3);
+}
+
+.hitl-approve:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(16, 185, 129, 0.45);
 }
 
 .hitl-reject {
-  background: #dc2626;
-  color: #fff;
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(239, 68, 68, 0.3);
 }
+
+.hitl-reject:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(239, 68, 68, 0.45);
+}
+
+.hitl-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+.hitl-btn.active {
+  background: #059669;
+}
+
+.hitl-btn.active-reject {
+  background: #b91c1c;
+}
+
+.hitl-card.hitl-completed {
+  border-color: rgba(16, 185, 129, 0.35);
+  box-shadow: 0 4px 16px rgba(16, 185, 129, 0.1);
+}
+
+.hitl-card.hitl-completed .hitl-card-title {
+  background: linear-gradient(135deg, #10b981, #34d399);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+

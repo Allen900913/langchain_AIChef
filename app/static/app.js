@@ -257,15 +257,8 @@ async function sendMessage() {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    // Read stream（含 HITL 中斷處理）
-    const { assistantContent } = await consumeStream(response);
-    const { text: responseText, interrupt } = splitInterrupt(assistantContent);
-
-    if (interrupt) {
-      renderInterrupt(interrupt.action_requests);
-    } else if (!responseText.trim()) {
-      appendMessage('assistant', '（無回應）', true);
-    }
+    // Read Typed SSE stream
+    await consumeTypedStream(response);
 
   } catch (error) {
     typingEl.remove();
@@ -278,90 +271,379 @@ async function sendMessage() {
   }
 }
 
-// 讀取串流回應，邊收邊顯示文字（自動隱藏結尾的 interrupt JSON），回傳完整內容
-async function consumeStream(response) {
+// =============================================
+//  Tool Metadata & Friendly Display
+// =============================================
+
+const TOOL_META = {
+  web_search: { name: '搜尋食譜與烹飪技巧', icon: '🔍' },
+  nutrition_lookup: { name: '查詢食材營養成分', icon: '🥗' },
+  inventory_get: { name: '查詢冰箱現有食材', icon: '🧊' },
+  inventory_add: { name: '新增食材至冰箱庫存', icon: '📥' },
+  inventory_remove: { name: '從冰箱庫存移除食材', icon: '📤' },
+  shopping_list_generate: { name: '比對缺料並產生採購清單', icon: '🛒' },
+  profiles_get: { name: '確認個人飲食偏好與設備', icon: '👤' },
+  diet_profile_manage: { name: '更新飲食限制與過敏原', icon: '📝' },
+  kitchen_profile_manage: { name: '更新廚房設備設定', icon: '🍳' },
+  household_profile_manage: { name: '更新家庭用餐偏好', icon: '🏠' },
+  set_goal: { name: '記錄當前烹飪目標', icon: '🎯' },
+  step_tracker_start: { name: '啟動步驟引導模式', icon: '⏱️' },
+  step_tracker_next: { name: '推進至下一個步驟', icon: '⏭️' },
+  step_tracker_current: { name: '確認當前步驟進度', icon: '📌' },
+};
+
+
+// =============================================
+//  Typed SSE Stream Consumer
+// =============================================
+
+async function consumeTypedStream(response, existingMessageEl = null) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let assistantContent = '';
-  let messageEl = null;
+  let buffer = '';
+  let assistantText = '';
+  let messageEl = existingMessageEl;
+
+  function ensureMessageEl() {
+    if (!messageEl) {
+      messageEl = appendMessage('assistant', '', true);
+    }
+    return messageEl;
+  }
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
-    const chunk = decoder.decode(value, { stream: true });
-    if (!chunk) continue;
-    assistantContent += chunk;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() || '';
 
-    // 顯示時把 interrupt JSON 那段藏起來，只秀純文字
-    const { text } = splitInterrupt(assistantContent);
-    if (!messageEl) {
-      messageEl = appendMessage('assistant', text, true);
-    } else {
-      updateMessageContent(messageEl, text);
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      let eventType = 'token';
+      let dataText = '';
+
+      for (const line of part.split('\n')) {
+        if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          const content = line.slice(5).trim();
+          dataText += (dataText ? '\n' : '') + content;
+        }
+      }
+
+      if (!dataText) continue;
+
+      let payload;
+      try {
+        payload = JSON.parse(dataText);
+      } catch {
+        payload = { delta: dataText };
+      }
+
+      switch (eventType) {
+        case 'token': {
+          const delta = typeof payload === 'string' ? payload : (payload.delta || '');
+          if (delta) {
+            const el = ensureMessageEl();
+            assistantText += delta;
+            updateMessageContent(el, assistantText);
+            scrollToBottom();
+          }
+          break;
+        }
+
+        case 'tool_start': {
+          const el = ensureMessageEl();
+          addToolStart(el, payload);
+          // 工具開始執行代表尚未進入最終回答階段，清空 tool-call 階段產生的草稿碎片
+          if (assistantText) {
+            assistantText = '';
+            updateMessageContent(el, '');
+          }
+          scrollToBottom();
+          break;
+        }
+
+        case 'tool_end': {
+          const el = ensureMessageEl();
+          updateToolEnd(el, payload);
+          scrollToBottom();
+          break;
+        }
+
+        case 'interrupt': {
+          const el = ensureMessageEl();
+          renderInterruptCard(el, payload.action_requests);
+          // 中斷授權時清空 tool-call 階段產生的未授權草稿文字
+          if (assistantText) {
+            assistantText = '';
+            updateMessageContent(el, '');
+          }
+          scrollToBottom();
+          break;
+        }
+
+        case 'status': {
+          const el = ensureMessageEl();
+          renderStatusBanner(el, payload.message, payload.level || 'warning');
+          scrollToBottom();
+          break;
+        }
+
+        case 'error': {
+          const el = ensureMessageEl();
+          renderStatusBanner(el, payload.message, 'error');
+          scrollToBottom();
+          break;
+        }
+
+        case 'done': {
+          break;
+        }
+
+        default: {
+          if (payload && payload.delta) {
+            const el = ensureMessageEl();
+            assistantText += payload.delta;
+            updateMessageContent(el, assistantText);
+          }
+          break;
+        }
+      }
     }
-    scrollToBottom();
   }
 
-  return { assistantContent, messageEl };
-}
-
-// 後端在 HITL 時會 yield 一段 {"type": "interrupt", ...} 的 JSON。
-// 把它從串流文字中切出來：text = 前面的純文字，interrupt = 解析後的物件（或 null）
-function splitInterrupt(fullText) {
-  const idx = fullText.indexOf('{"type": "interrupt"');
-  if (idx === -1) return { text: fullText, interrupt: null };
-
-  let interrupt = null;
-  try {
-    interrupt = JSON.parse(fullText.slice(idx));
-  } catch {
-    // JSON 還沒收完，先當作沒有，等下一個 chunk
+  // 處理殘留 buffer
+  if (buffer.trim()) {
+    let eventType = 'token';
+    let dataText = '';
+    for (const line of buffer.split('\n')) {
+      if (line.startsWith('event:')) {
+        eventType = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        dataText += (dataText ? '\n' : '') + line.slice(5).trim();
+      }
+    }
+    if (dataText && eventType === 'token') {
+      try {
+        const p = JSON.parse(dataText);
+        if (p.delta) {
+          const el = ensureMessageEl();
+          assistantText += p.delta;
+          updateMessageContent(el, assistantText);
+        }
+      } catch {
+        const el = ensureMessageEl();
+        assistantText += dataText;
+        updateMessageContent(el, assistantText);
+      }
+    }
   }
-  return { text: fullText.slice(0, idx), interrupt };
+
+  if (!assistantText.trim() && messageEl && !messageEl.querySelector('.tool-activity-card') && !messageEl.querySelector('.hitl-card')) {
+    updateMessageContent(messageEl, '（無回應）');
+  }
+
+  return { messageEl, assistantText };
 }
 
-// 把待審核的工具呼叫渲染成「同意 / 拒絕」卡片
-function renderInterrupt(actionRequests) {
-  const wrapper = document.getElementById('messagesWrapper');
-  const el = document.createElement('div');
-  el.className = 'message assistant';
 
-  // 後端 InterruptOnConfig 的 description 已是可直接顯示的中文說明（見 app.py
-   // _describe_inventory_remove / _describe_profile_delete）；優先用它，沒有才
-   // 退回顯示 name(args) 原始資訊。description 可能含換行，用 white-space 保留。
+// =============================================
+//  Interactive Tool Activity Card
+// =============================================
+
+function getOrCreateToolCard(messageEl) {
+  const body = messageEl.querySelector('.message-body');
+  let card = body.querySelector('.tool-activity-card');
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'tool-activity-card expanded';
+    card.innerHTML = `
+      <div class="tool-card-header" onclick="toggleToolCard(this)">
+        <div class="tool-card-title">
+          <span class="tool-status-icon pulse-dot"></span>
+          <span class="tool-card-label">正在調用工具...</span>
+        </div>
+        <button type="button" class="tool-card-toggle">收合 ▴</button>
+      </div>
+      <div class="tool-card-body"></div>
+    `;
+    const contentEl = body.querySelector('.message-content');
+    body.insertBefore(card, contentEl);
+  }
+  return card;
+}
+
+function toggleToolCard(headerEl) {
+  const card = headerEl.closest('.tool-activity-card');
+  if (!card) return;
+  card.classList.toggle('expanded');
+  const toggleBtn = card.querySelector('.tool-card-toggle');
+  if (toggleBtn) {
+    toggleBtn.textContent = card.classList.contains('expanded') ? '收合 ▴' : '展開 ▾';
+  }
+}
+
+function addToolStart(messageEl, toolData) {
+  const card = getOrCreateToolCard(messageEl);
+  const body = card.querySelector('.tool-card-body');
+  const meta = TOOL_META[toolData.tool] || { name: toolData.tool, icon: '🔧' };
+
+  const toolItem = document.createElement('div');
+  toolItem.className = 'tool-item status-running';
+  const toolId = toolData.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  toolItem.id = `tool-item-${toolId}`;
+
+  let argsStr = '';
+  if (toolData.args && Object.keys(toolData.args).length > 0) {
+    try {
+      argsStr = JSON.stringify(toolData.args, null, 2);
+    } catch {
+      argsStr = String(toolData.args);
+    }
+  }
+
+  toolItem.innerHTML = `
+    <div class="tool-item-header">
+      <div class="tool-item-info">
+        <span class="tool-item-icon">${meta.icon}</span>
+        <span class="tool-item-name">${escapeHtml(meta.name)}</span>
+      </div>
+      <span class="tool-item-badge badge-running">
+        <span class="spinner-small"></span> 執行中...
+      </span>
+    </div>
+    ${argsStr ? `<div class="tool-item-args"><span class="args-label">參數：</span><code>${escapeHtml(argsStr)}</code></div>` : ''}
+  `;
+  body.appendChild(toolItem);
+  updateToolCardSummary(card);
+}
+
+function updateToolEnd(messageEl, toolData) {
+  const card = getOrCreateToolCard(messageEl);
+  const body = card.querySelector('.tool-card-body');
+  let toolItem = toolData.id ? document.getElementById(`tool-item-${toolData.id}`) : null;
+  if (!toolItem) {
+    const items = body.querySelectorAll('.tool-item.status-running');
+    if (items.length > 0) toolItem = items[items.length - 1];
+  }
+
+  if (toolItem) {
+    toolItem.classList.remove('status-running');
+    const isError = toolData.status === 'error';
+    toolItem.classList.add(isError ? 'status-error' : 'status-success');
+
+    const badge = toolItem.querySelector('.tool-item-badge');
+    if (badge) {
+      if (isError) {
+        badge.className = 'tool-item-badge badge-error';
+        badge.innerHTML = '✕ 執行失敗';
+      } else {
+        badge.className = 'tool-item-badge badge-success';
+        badge.innerHTML = '✓ 已完成';
+      }
+    }
+
+    if (toolData.content) {
+      const resultDiv = document.createElement('div');
+      resultDiv.className = 'tool-item-result';
+      resultDiv.innerHTML = `
+        <span class="result-label">結果摘要：</span>
+        <pre><code>${escapeHtml(toolData.content)}</code></pre>
+      `;
+      toolItem.appendChild(resultDiv);
+    }
+  }
+  updateToolCardSummary(card);
+}
+
+function updateToolCardSummary(card) {
+  const allItems = card.querySelectorAll('.tool-item');
+  const runningItems = card.querySelectorAll('.tool-item.status-running');
+  const label = card.querySelector('.tool-card-label');
+  const icon = card.querySelector('.tool-status-icon');
+
+  if (runningItems.length > 0) {
+    icon.className = 'tool-status-icon pulse-dot';
+    label.textContent = `正在調用工具... (${allItems.length})`;
+  } else {
+    icon.className = 'tool-status-icon check-dot';
+    label.textContent = `⚡ 已完成 ${allItems.length} 項工具調用`;
+  }
+}
+
+
+// =============================================
+//  HITL & Status Cards
+// =============================================
+
+function renderInterruptCard(messageEl, actionRequests) {
+  const body = messageEl.querySelector('.message-body');
+  const existingCard = body.querySelector('.hitl-card');
+  if (existingCard) existingCard.remove();
+
+  const card = document.createElement('div');
+  card.className = 'hitl-card';
+
   const list = actionRequests.map(a =>
     a.description
       ? `<div class="hitl-tool" style="white-space:pre-wrap">🔧 ${escapeHtml(a.description)}</div>`
       : `<div class="hitl-tool">🔧 <strong>${escapeHtml(a.name)}</strong>(${escapeHtml(JSON.stringify(a.args))})</div>`
   ).join('');
 
-  el.innerHTML = `
-    <div class="message-avatar">🔐</div>
-    <div class="message-body">
-      <div class="message-sender">需要你的核准</div>
-      <div class="message-content">
-        <p>AI 想執行以下工具，請選擇是否允許：</p>
-        ${list}
-        <div class="hitl-actions">
-          <button class="hitl-btn hitl-approve" onclick="resolveInterrupt(this, 'approve', ${actionRequests.length})">✅ 同意</button>
-          <button class="hitl-btn hitl-reject" onclick="resolveInterrupt(this, 'reject', ${actionRequests.length})">❌ 拒絕</button>
-        </div>
+  card.innerHTML = `
+    <div class="hitl-card-header">
+      <span class="hitl-card-icon">🔐</span>
+      <span class="hitl-card-title">需要您的授權確認</span>
+    </div>
+    <div class="hitl-card-body">
+      <p class="hitl-card-desc">AI 廚師即將執行以下狀態修改操作，請確認是否允許：</p>
+      <div class="hitl-tool-list">${list}</div>
+      <div class="hitl-actions">
+        <button class="hitl-btn hitl-approve" onclick="resolveInterrupt(this, 'approve', ${actionRequests.length})">
+          <span class="btn-icon">✓</span> 同意執行
+        </button>
+        <button class="hitl-btn hitl-reject" onclick="resolveInterrupt(this, 'reject', ${actionRequests.length})">
+          <span class="btn-icon">✕</span> 拒絕操作
+        </button>
       </div>
-    </div>`;
-  wrapper.appendChild(el);
-  scrollToBottom();
+    </div>
+  `;
+
+  const contentEl = body.querySelector('.message-content');
+  body.insertBefore(card, contentEl);
 }
 
-// 使用者點同意/拒絕後，呼叫 /chat/resume 繼續執行（並處理可能的下一個 interrupt）
+function renderStatusBanner(messageEl, text, level = 'warning') {
+  const body = messageEl.querySelector('.message-body');
+  const banner = document.createElement('div');
+  banner.className = `status-banner banner-${level}`;
+  const icon = level === 'error' ? '💥' : '⚠️';
+  banner.innerHTML = `
+    <span class="banner-icon">${icon}</span>
+    <span class="banner-text">${escapeHtml(text)}</span>
+  `;
+  const contentEl = body.querySelector('.message-content');
+  body.insertBefore(banner, contentEl);
+}
+
 async function resolveInterrupt(btn, decision, count) {
   if (state.isStreaming) return;
 
-  const actionsEl = btn.closest('.hitl-actions');
+  const card = btn.closest('.hitl-card');
+  const actionsEl = card.querySelector('.hitl-actions');
   actionsEl.querySelectorAll('button').forEach(b => b.disabled = true);
-  btn.textContent = decision === 'approve' ? '已同意，執行中…' : '已拒絕';
 
-  // 每個待審核工具都要對應一個 decision
+  if (decision === 'approve') {
+    btn.innerHTML = `<span class="spinner-small"></span> 已同意，執行中...`;
+    btn.classList.add('active');
+  } else {
+    btn.innerHTML = `✕ 已拒絕操作`;
+    btn.classList.add('active-reject');
+  }
+
   const decisions = [];
   for (let i = 0; i < count; i++) {
     decisions.push(
@@ -374,6 +656,7 @@ async function resolveInterrupt(btn, decision, count) {
   state.isStreaming = true;
   updateSendButton();
   const typingEl = showTypingIndicator();
+  const messageEl = card.closest('.message');
 
   try {
     const response = await fetch(`${API_BASE}/chat/resume`, {
@@ -385,20 +668,21 @@ async function resolveInterrupt(btn, decision, count) {
       }),
     });
 
-    typingEl.remove();
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    await consumeTypedStream(response, messageEl);
 
-    const { assistantContent } = await consumeStream(response);
-    const { interrupt } = splitInterrupt(assistantContent);
-
-    // 可能還有下一個待審核的工具
-    if (interrupt) {
-      renderInterrupt(interrupt.action_requests);
+    // 執行完畢後更新按鈕狀態，移除旋轉中圖示
+    if (decision === 'approve') {
+      btn.innerHTML = `<span class="btn-icon">✓</span> 已授權並執行完成`;
+      card.classList.add('hitl-completed');
+    } else {
+      btn.innerHTML = `<span class="btn-icon">✕</span> 已拒絕操作`;
+      card.classList.add('hitl-rejected');
     }
   } catch (error) {
     typingEl.remove();
     appendMessage('assistant', `⚠️ 發生錯誤: ${error.message}`, true);
     showToast('繼續執行失敗', true);
+    btn.innerHTML = `⚠️ 執行失敗`;
   } finally {
     state.isStreaming = false;
     updateSendButton();

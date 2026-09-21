@@ -20,6 +20,11 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agents.tools import ALL_TOOLS
 from app.agents.tool_index import retrieve_tool_names
+from app.agents.prompt_manager import (
+    PROMPT_REWRITE,
+    DEFAULT_REWRITE_PROMPT,
+    compile_prompt as _compile_lf_prompt,
+)
 
 _TOOL_MAP = {t.name: t for t in ALL_TOOLS}
 
@@ -40,53 +45,6 @@ _IMAGE_MARKER = "系統自動辨識圖片中的食材"
 # 由 app.py init_agent_infra 注入 summary_model（Groq llama-3.1-8b-instant，低延遲）。
 # None 表示尚未啟用 → 跳過重寫，直接用原文檢索。沿用 tools.py 的注入慣例。
 _rewrite_model = None
-
-_REWRITE_PROMPT = """你是一個「意圖翻譯官」，只翻譯使用者當下想做的「動作」，用來檢索最合適的工具。
-
-【嚴格禁忌】
-1. 絕對不要預測答案、不要接續對話、不要幫使用者把下一步的具體內容編出來！
-2. 絕對不可以遺漏使用者提到的「關鍵實體、食材、過敏原或限制條件」！
-
-【核心原則】
-- 如果使用者是在「陳述狀況、過敏原、飲食限制或個人偏好」，請 100% 保留所有名詞與條件，不可簡化為抽象句。
-
-【範例 1：代名詞與主詞還原】
-歷史：使用者：幫我查 A 專案的進度 / 助理：已完成 80%
-使用者最後一句：那 B 專案呢
-輸出：<query>查詢 B 專案的進度</query>
-
-【範例 2：系統流程指令 (純動作，不預測內容)】
-歷史：助理：第一步：請輸入舊密碼
-使用者最後一句：下一步
-輸出：<query>前進到流程的下一個步驟</query>
-（❌ 錯誤示範，不要這樣寫：<query>輸入新密碼</query>——這是在編造下一步內容）
-
-【範例 3：對話確認/否定 (僅在助理主動詢問時套用)】
-歷史：助理：確認要刪除這筆紀錄嗎？
-使用者最後一句：對，都刪了吧
-輸出：<query>確認執行刪除操作</query>
-
-【範例 4：陳述個人狀況/過敏限制 (關鍵詞全留)】
-歷史：（無）
-使用者最後一句：我對花生過敏，不能吃蝦
-輸出：<query>記錄對花生過敏且不能吃蝦的飲食限制</query>
-（❌ 錯誤示範，不要這樣寫：<query>確認不能吃蝦</query>——這遺漏了過敏原名詞）
-
-規則：
-- 消除代名詞與上下文依賴，但只還原「動作」，不要補充猜測內容。
-- 必須完整保留所有的「過敏原、食材、數量、偏好」。
-
-【輸出格式】
-你必須且只能將最終的重寫結果包在 <query> 與 </query> 標籤中，不管前面加了什麼說明文字都沒關係，
-只有標籤內的內容會被採用。例如：<query>查詢台北天氣</query>
-
-<對話歷史>
-{history}
-</對話歷史>
-
-<使用者最後一句>
-{latest}
-</使用者最後一句>"""
 
 
 def _clean(text: str) -> str:
@@ -149,8 +107,15 @@ async def _rewrite_query(history: str, latest: str) -> str:
     if _rewrite_model is None or not latest:
         return latest
     try:
+        # 動態取得並編譯 Prompt（prompt_manager 帶 300s 快取，支援 Langfuse 與本地 fallback）
+        prompt_text = _compile_lf_prompt(
+            PROMPT_REWRITE,
+            DEFAULT_REWRITE_PROMPT,
+            history=history or "（無）",
+            latest=latest,
+        )
         resp = await _rewrite_model.ainvoke(
-            _REWRITE_PROMPT.format(history=history or "（無）", latest=latest),
+            prompt_text,
             config={"callbacks": []},
         )
         raw = resp.content or ""
