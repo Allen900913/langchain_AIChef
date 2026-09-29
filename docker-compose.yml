@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: zxcv65428
       POSTGRES_DB: ai_memory
     ports:
-      - "5435:5432"
+      - "5487:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -19,8 +19,8 @@ services:
     image: qdrant/qdrant
     container_name: qdrant-ai-chef
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "6397:6333"
+      - "6398:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped

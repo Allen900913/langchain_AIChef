@@ -96,35 +96,49 @@ _thread_recent_calls: dict[str, deque] = {}
 # 1. 模型 & 基礎設施
 # ==============================================================================
 
-# 主模型：NVIDIA NIM 代管的 openai/gpt-oss-120b，負責 tool-calling 對話。
+# 主模型：Groq 代管的 openai/gpt-oss-120b，負責 tool-calling 對話。
+# 換用 Groq 以避免 NVIDIA NIM 免費端點頻繁過載（Service temporarily overloaded）。
+# ⚠️ 三個 Groq 模型分別使用不同 API Key，避免共用同一把 Key 撞到 RPM 限流。
 model = init_chat_model(
     "openai/gpt-oss-120b",
-    model_provider="openai",
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=os.getenv("NVIDIA_API_KEY"),
+    model_provider="groq",
+    api_key=os.getenv("GROQ_API_KEY"),
     temperature=0.2,
     request_timeout=50.0,
     max_retries=3,
 )
 
 # 摘要任務（摘要壓縮／web_search 蒸餾／過敏原安全檢查等輕量子任務）使用 Groq 的 openai/gpt-oss-20b：
-# 延遲低、便宜，指令遵循穩定。
+# 延遲低、便宜，指令遵循穩定。使用 GROQ_API_KEY2 分散負載。
 summary_model = init_chat_model(
     "openai/gpt-oss-20b",
     model_provider="groq",
-    api_key=os.getenv("GROQ_API_KEY"),
+    api_key=os.getenv("GROQ_API_KEY2"),
     temperature=0,
     request_timeout=50.0,
 )
 
 # 圖片辨識專用：qwen/qwen3.8-27b 是 Groq 上唯一支援圖片輸入的模型
+# 使用 GROQ_API_KEY3 分散負載。
 vision_model = init_chat_model(
     "qwen/qwen3.8-27b",
     model_provider="groq",
-    api_key=os.getenv("GROQ_API_KEY"),
+    api_key=os.getenv("GROQ_API_KEY3"),
     temperature=0,
     request_timeout=30.0,
     max_retries=2,
+)
+
+# Prompt injection 偵測：Meta 的 llama-prompt-guard-2-22m（DeBERTa-xsmall 分類器，22M 參數）。
+# 專門偵測 prompt injection 與 jailbreak 攻擊，延遲極低（<100ms），是輸入端的第一道防線。
+# 使用 GROQ_API_KEY2 分散負載（模型極小，不太會撞 RPM 限流）。
+prompt_guard_model = init_chat_model(
+    "meta-llama/llama-prompt-guard-2-22m",
+    model_provider="groq",
+    api_key=os.getenv("GROQ_API_KEY2"),
+    temperature=0,
+    request_timeout=10.0,
+    max_retries=1,
 )
 
 
@@ -488,6 +502,11 @@ def _describe_profile_delete(tool_call, state, runtime) -> str:
     return f"確認要刪除這筆長期記憶嗎？\naction={args.get('action')} id={args.get('id')}"
 
 
+def _describe_web_search(tool_call, state, runtime) -> str:
+    query = tool_call["args"].get("query", "未知查詢")
+    return f"確認要進行網路搜尋嗎？\n搜尋關鍵字：{query}"
+
+
 def _hitl_interrupt_on() -> dict[str, InterruptOnConfig]:
     """精細版 HITL 設定：只攔真正有風險、不可逆的動作，其餘自動放行。
 
@@ -496,6 +515,7 @@ def _hitl_interrupt_on() -> dict[str, InterruptOnConfig]:
       刪少量屬日常操作，攔了只會反覆打斷使用者。用 when 述詞動態判斷。
     - 三個 *_profile_manage：只攔 action="delete"（刪既有 profile 才不可逆）；
       create / update 是累積記憶的正常行為，不需要每次都要求人工確認。
+    - web_search：每次搜尋都攔截確認（依使用者要求）。
     """
     remove_cfg = InterruptOnConfig(
         allowed_decisions=["approve", "reject"],
@@ -508,11 +528,16 @@ def _hitl_interrupt_on() -> dict[str, InterruptOnConfig]:
         description=_describe_profile_delete,
         when=lambda req: req.tool_call["args"].get("action") == "delete",
     )
+    web_search_cfg = InterruptOnConfig(
+        allowed_decisions=["approve", "reject"],
+        description=_describe_web_search,
+    )
     return {
         "inventory_remove": remove_cfg,
         "diet_profile_manage": profile_delete_cfg,
         "kitchen_profile_manage": profile_delete_cfg,
         "household_profile_manage": profile_delete_cfg,
+        "web_search": web_search_cfg,
     }
 
 
@@ -645,12 +670,71 @@ async def _describe_image(image_url: str) -> str:
         return ""
 
 
+# ==============================================================================
+# Prompt Injection Guard（輸入端前哨）
+# ==============================================================================
+
+async def _check_prompt_injection(text: str) -> bool:
+    """呼叫 llama-prompt-guard-2-22m 判斷使用者輸入是否含 prompt injection。
+
+    回傳 True = 偵測到惡意注入，False = 安全。
+    失敗時 fail open（回傳 False）：guard 故障不應阻斷正常服務。
+    與 chef_guardrail_prompt（檢查 web_search 輸出）互補——此處守輸入端，
+    那邊守外部資料端，形成縱深防禦。
+
+    callbacks=[] 切斷與外層 run 的 callback 鏈（同 _find_recommended_allergen 的做法）。
+    """
+    if not text or not text.strip():
+        return False
+    try:
+        async with asyncio.timeout(5.0):
+            resp = await prompt_guard_model.ainvoke(
+                text[:512],   # 模型 context window 為 512 tokens
+                config={"callbacks": []},
+            )
+        raw = (resp.content or "").strip()
+
+        # llama-prompt-guard-2-22m 透過 Groq Chat API 回傳的格式：
+        # - 純浮點數（例如 "0.9989678859710693"）：越接近 1.0 代表越可能是 injection
+        # - 或文字標籤（"MALICIOUS" / "BENIGN"）：依 API 版本不同
+        # 兩種格式都處理，確保未來 API 行為變更時仍然相容。
+        try:
+            score = float(raw)
+            is_malicious = score > 0.9   # 閾值 0.9：分數 > 0.9 視為 injection
+        except ValueError:
+            is_malicious = "MALICIOUS" in raw.upper()
+            score = 1.0 if is_malicious else 0.0
+
+        if is_malicious:
+            print(f"🛡️ [PROMPT-GUARD] 偵測到 prompt injection（score={score:.4f}）：{text[:100]!r}")
+        else:
+            print(f"🛡️ [PROMPT-GUARD] 輸入安全（score={score:.4f}）")
+        return is_malicious
+    except Exception as exc:
+        print(f"⚠️ [PROMPT-GUARD] 偵測失敗（fail open）：{type(exc).__name__}: {exc}")
+        return False
+
+
+async def _blocked_response():
+    """Prompt injection 被攔截時回傳的 SSE 串流。"""
+    yield _format_sse("status", {
+        "code": "PROMPT_INJECTION",
+        "level": "error",
+        "message": "偵測到疑似惡意指令注入，已攔截此訊息。請以正常方式描述您的需求。",
+    })
+    yield _format_sse("done", {"status": "complete"})
+
+
 async def call_agent(
     message: str,
     imageUrl: str,
     thread_id: str,
     user_id: str | None = None,
 ):
+    # --- Prompt Guard：在 Agent 前攔截 prompt injection ---
+    if await _check_prompt_injection(message):
+        return _blocked_response()
+
     if imageUrl is not None:
         description = await _describe_image(imageUrl)
         text = f"<user_input>\n{message}\n</user_input>"
@@ -672,10 +756,18 @@ async def call_agent(
         },
         # 機制一：最大步數。每輪 = model 節點 + tools 節點 = 2 次遞迴，+1 留給最後回覆
         "recursion_limit": MAX_STEPS * 2 + 1,
+        "metadata": {
+            "langfuse_session_id": thread_id,
+            "langfuse_user_id": user_id or DEFAULT_USER_ID,
+        }
     }
-    # 注入 Langfuse callback（只需在最外層注入，會自動傳播到所有巢狀呼叫）
-    if _langfuse_handler:
-        config["callbacks"] = [_langfuse_handler]
+    # 每次請求建立獨立的 Langfuse handler，設定 trace_name 和 session_id，
+    # 讓每一筆對話在 Langfuse 面板上顯示為獨立、標題清楚的 Trace。
+    if os.getenv("LANGFUSE_PUBLIC_KEY"):
+        per_request_handler = LangfuseCallbackHandler()
+        config["callbacks"] = [per_request_handler]
+        config["run_name"] = f"Chat: {message[:30]}"
+
 
     # 目標由 LLM 自行從對話歷史判斷（不維護程式端的顯式錨）。使用者原始請求
     # 保留在 messages 中；被摘要壓縮時，靠 _SUMMARY_PROMPT 明確保留其原始意圖。
@@ -698,10 +790,16 @@ def resume_agent(
             "user_id": user_id or DEFAULT_USER_ID,
         },
         "recursion_limit": MAX_STEPS * 2 + 1,
+        "metadata": {
+            "langfuse_session_id": thread_id,
+            "langfuse_user_id": user_id or DEFAULT_USER_ID,
+        }
     }
-    # 注入 Langfuse callback（只需在最外層注入，會自動傳播到所有巢狀呼叫）
-    if _langfuse_handler:
-        config["callbacks"] = [_langfuse_handler]
+    # 每次 resume 也建立獨立的 Langfuse handler
+    if os.getenv("LANGFUSE_PUBLIC_KEY"):
+        per_request_handler = LangfuseCallbackHandler()
+        config["callbacks"] = [per_request_handler]
+        config["run_name"] = "HITL Resume"
 
     return _stream_agent(Command(resume={"decisions": decisions}), config)
 

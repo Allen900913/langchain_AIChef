@@ -40,7 +40,7 @@ from fastembed import SparseTextEmbedding, TextEmbedding
 
 from app.agents.tools import ALL_TOOLS
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6397")
 COLLECTION = "chef_tools"
 
 # 中文專用、512 維、僅 90MB：工具 description 全是中文，用中文模型召回優於多語通用模型。

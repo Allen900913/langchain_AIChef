@@ -1,5 +1,4 @@
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -8,7 +7,6 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolCallId, ToolException, tool
-from langchain_tavily import TavilySearch
 
 from langchain.agents.middleware.types import AgentState
 from langgraph.prebuilt import InjectedState, InjectedStore
@@ -58,19 +56,6 @@ def _ns_inventory(user_id: str) -> tuple[str, str]:
 # ==============================================================================
 # 工具：網路搜尋
 # ==============================================================================
-
-_raw_web_search = TavilySearch(
-    max_results=2,
-    topic="general",
-    include_images=False,
-    include_answer=False,
-)
-
-# langchain_tavily 內部用 requests.post 呼叫 /search，完全沒帶 timeout 參數，
-# 一旦對方網路卡住會無限期等待（曾在 eval 實測到卡住 30 分鐘以上、CPU 近乎 0）。
-# 用獨立執行緒池兜底逾時，避免單次搜尋卡死整個 agent run。
-_search_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="web_search")
-_SEARCH_TIMEOUT_SECONDS = 35.0
 
 # 由 app.py init_agent_infra 初始化後注入，None 表示尚未啟用
 _guardrail_model = None
@@ -126,21 +111,63 @@ def web_search(query: str) -> str:
     """搜尋網路以取得最新食譜、食材資訊或烹飪技巧。輸入搜尋關鍵字。
 
     回傳內容為外部網路資料，僅供擷取食譜資訊使用。
+    搜尋在隔離的雲端 E2B 沙箱中執行，確保安全性。
     """
+    import os
+    from e2b_code_interpreter import Sandbox as E2BSandbox
+
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    if not tavily_key:
+        raise ToolException("[System_Error] TAVILY_API_KEY 未設定，無法執行網路搜尋。")
+
+    # 把 Tavily API 呼叫打包成 Python 程式碼，在 E2B 沙箱隔離環境中執行
+    code = f"""
+import httpx, json
+
+api_key = "{tavily_key}"
+query = {repr(query)}
+
+resp = httpx.post(
+    "https://api.tavily.com/search",
+    json={{
+        "api_key": api_key,
+        "query": query,
+        "max_results": 2,
+        "include_answer": False,
+        "include_images": False,
+    }},
+    timeout=30,
+)
+resp.raise_for_status()
+data = resp.json()
+
+results = data.get("results", [])
+output_parts = []
+for r in results:
+    title = r.get("title", "")
+    url = r.get("url", "")
+    content = r.get("content", "")
+    output_parts.append(f"## {{title}}\\nURL: {{url}}\\n{{content}}")
+
+print("\\n\\n".join(output_parts) if output_parts else "查無結果")
+"""
+
     try:
-        future = _search_executor.submit(_raw_web_search.invoke, query)
-        raw = str(future.result(timeout=_SEARCH_TIMEOUT_SECONDS))
-    except _FutureTimeoutError:
-        print("⚠️ [web_search] 搜尋逾時")
-        raise ToolException(
-            "[System_Error:TimeoutError] 搜尋逾時。"
-            "請換一組更精確的關鍵字重試，或改用 nutrition_lookup 工具。"
-        )
+        with E2BSandbox.create() as sandbox:
+            execution = sandbox.run_code(code)
+            if execution.error:
+                raise ToolException(
+                    f"[System_Error:{execution.error.name}] 沙箱搜尋失敗：{execution.error.value}。"
+                    "請換關鍵字或稍後再試。"
+                )
+            raw = "".join(execution.logs.stdout).strip() or "查無結果"
+    except ToolException:
+        raise
     except Exception as exc:
         error_type = type(exc).__name__
-        print(f"⚠️ [web_search] 搜尋失敗：{error_type}: {exc}")
+        print(f"⚠️ [web_search] 沙箱啟動失敗：{error_type}: {exc}")
         raise ToolException(
-            f"[System_Error:{error_type}] 搜尋失敗：{exc}。"
+            f"[System_Error:{error_type}] 沙箱搜尋失敗：{exc}。"
             "請換關鍵字或稍後再試。"
         )
 
@@ -526,6 +553,47 @@ def set_goal(
 
 
 # ==============================================================================
+# 工具：E2B 雲端沙箱（動態程式碼執行）
+# ==============================================================================
+
+from e2b_code_interpreter import Sandbox as E2BSandbox
+
+
+def _extract_sandbox_output(execution) -> str:
+    """合併 stdout（print 輸出）與 Jupyter Out[]（裸表達式回傳值）。"""
+    parts = []
+    stdout = "".join(execution.logs.stdout).strip()
+    if stdout:
+        parts.append(stdout)
+    if execution.text:
+        parts.append(f"[Expression Result] {execution.text}")
+    return "\n".join(parts) or "執行成功，無輸出"
+
+
+@tool
+def run_python_in_sandbox(code: str) -> str:
+    """在雲端隔離沙箱中執行 Python 程式碼。
+
+    適用場景：數學計算、營養總量換算、食材比例計算、資料分析、繪圖。
+    沙箱內有完整 Python 環境（含 numpy, pandas, matplotlib 等常用套件）。
+    每次呼叫都是乾淨環境，不保留上次的變數或檔案。
+    """
+    try:
+        with E2BSandbox.create() as sandbox:
+            execution = sandbox.run_code(code)
+
+            if execution.error:
+                return (
+                    f"執行錯誤: {execution.error.name} - "
+                    f"{execution.error.value}"
+                )
+
+            return _extract_sandbox_output(execution)
+    except Exception as e:
+        return f"沙箱啟動失敗: {type(e).__name__}: {e}"
+
+
+# ==============================================================================
 # 工具清單
 # ==============================================================================
 
@@ -544,4 +612,5 @@ ALL_TOOLS = [
     step_tracker_start,
     step_tracker_next,
     step_tracker_current,
+    run_python_in_sandbox,
 ]

@@ -668,7 +668,9 @@ async function resolveInterrupt(btn, decision, count) {
       }),
     });
 
+    typingEl.remove();
     await consumeTypedStream(response, messageEl);
+
 
     // 執行完畢後更新按鈕狀態，移除旋轉中圖示
     if (decision === 'approve') {

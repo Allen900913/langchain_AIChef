@@ -24,6 +24,7 @@ dependencies = [
     "markdown-it-py>=4.2.0",
     "qdrant-client[fastembed]>=1.18.0",
     "langfuse>=4.15.1",
+    "e2b-code-interpreter>=2.10.0",
 ]
 
 [dependency-groups]
