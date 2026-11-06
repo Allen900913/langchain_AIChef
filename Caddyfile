@@ -1,0 +1,44 @@
+# 對外唯一入口：Caddy 負責 TLS（申請 / 續期憑證）與 http → https 轉址，
+# 解密後一律用 HTTP 轉給內部的 web（nginx），nginx 再把 /api 轉給 api。
+#
+# SITE_ADDRESS（.env，預設 localhost）決定憑證從哪來：
+#   localhost          → Caddy 用自己的本機 CA 簽發（瀏覽器要先信任它的根憑證，步驟見 README）
+#   chef.example.com   → 自動向 Let's Encrypt 申請、到期前自動續期
+#                        （DNS 要指到這台機器，80 / 443 要能從外網連進來）
+#
+# 不必另外設定的部分：
+#   - http://… 會自動 308 轉址到 https://…
+#   - Host 標頭原樣轉給 nginx，API 的 Origin 檢查（CSRF）比對的仍是使用者看到的網域
+#   - Content-Type 為 text/event-stream 的回應（SSE）會立即送出，不會被緩衝
+{$SITE_ADDRESS:localhost} {
+	# 安全標頭：所有回應（頁面、靜態檔、API）都加。區塊裡有刪除操作（-Server），
+	# Caddy 會等上游回應後才套用，所以 nginx / FastAPI 自己送的同名標頭也會被這裡的值蓋掉。
+	header {
+		# CSP：只允許載入自己網域的程式碼。對外來源逐一列出：
+		#   fonts.googleapis.com / fonts.gstatic.com → styles.css 的 Google Fonts
+		#   storage.googleapis.com → 登入使用者的圖片：瀏覽器直接 PUT 上傳（connect-src）、訊息裡顯示（img-src）
+		#   data: / blob: → 訪客圖片（Base64）、上傳前的預覽、favicon
+		# 模型回覆的 Markdown 若夾帶外部圖片 ![](https://…)，會被 img-src 擋下，
+		# 順便堵住「prompt injection 讓模型把資料塞進圖片網址送出去」這條外洩路徑。
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://storage.googleapis.com; connect-src 'self' https://storage.googleapis.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		# 不讓瀏覽器猜 Content-Type（避免把上傳的檔案當成 HTML / JS 執行）
+		X-Content-Type-Options "nosniff"
+		# 禁止被別的網站用 iframe 嵌入（點擊劫持）；CSP 的 frame-ancestors 是新寫法，這行給舊瀏覽器
+		X-Frame-Options "DENY"
+		# 跨站連結只送出網域，不送完整路徑（對話網址 /chat/{thread_id} 不外流）
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# 用不到的瀏覽器功能一律關閉（選圖片走檔案選擇器，不需要 camera 權限）
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		# 不透露伺服器軟體與版本
+		-Server
+	}
+
+	# HSTS：要求瀏覽器之後一律用 HTTPS 連這個網域。只對正式網域送：
+	# HSTS 綁主機名稱不綁 port，若對 localhost 送，瀏覽器會把 http://localhost:5173（Vite 開發伺服器）
+	# 也強制升級成 https，開發環境就打不開了。
+	# 先不加 includeSubDomains / preload：同網域底下若有還沒上 HTTPS 的子網域會被鎖在外面，確認後再加。
+	@public not host localhost 127.0.0.1
+	header @public Strict-Transport-Security "max-age=31536000"
+
+	reverse_proxy web:80
+}

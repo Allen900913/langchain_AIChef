@@ -5,18 +5,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from app.common.logger import setup_logging
-# 假設 chat 與 oss 路由模組位於以下路徑
+from app.api.v1 import auth as auth_api
 from app.api.v1 import chat
 from app.api.v1 import oss
-from app.agents.app import init_agent_infra
+from app.common import task_queue
+from app.services import auth, db, history
 
-# 註：cp950 → UTF-8 的 stdout/stderr reconfigure 已下沉到 app/agents/app.py 的
-# import 階段（emoji print 來源處），上面 import init_agent_infra 時即已生效。
+# API 伺服器刻意不 import agent（app/agents/*）：模型、fastembed、E2B 等重依賴只存在
+# worker（app/worker.py）。API 只負責收任務進佇列、把 worker 輸出轉成 SSE、讀歷史。
 
 # 初始化日誌配置
 setup_logging()
@@ -29,10 +31,43 @@ def selector_loop_factory(use_subprocess: bool = False) -> asyncio.AbstractEvent
     return asyncio.SelectorEventLoop()
 
 
+# 過期 refresh token 的清理週期。多個 API 行程時以 advisory lock 確保同一時間只有一個在清
+_CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
+_CLEANUP_LOCK_ID = 7_412_002
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        try:
+            async with db.get_pool().connection() as conn:
+                cur = await conn.execute("SELECT pg_try_advisory_lock(%s) AS ok", (_CLEANUP_LOCK_ID,))
+                if (await cur.fetchone())["ok"]:
+                    try:
+                        tokens = await auth.purge_expired_refresh_tokens()
+                        if tokens:
+                            print(f"🧹 [CLEANUP] 刪除過期 refresh token {tokens} 筆")
+                    finally:
+                        await conn.execute("SELECT pg_advisory_unlock(%s)", (_CLEANUP_LOCK_ID,))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # 清理失敗不影響服務，下一輪再試
+            print(f"⚠️ [CLEANUP] 清理失敗：{exc!r}")
+        await asyncio.sleep(_CLEANUP_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_agent_infra()
+    auth.check_config()  # JWT_SECRET 沒設定就直接啟動失敗
+    await db.init_pool()
+    await db.migrate()
+    await history.init_history()
+    await task_queue.get_redis().ping()  # 啟動時就確認 Redis 可達，而不是等第一個請求才炸
+    cleanup = asyncio.create_task(_cleanup_loop())
     yield
+    cleanup.cancel()
+    await task_queue.close_redis()
+    await history.close_history()
+    await db.close_pool()
 
 
 app = FastAPI(
@@ -42,46 +77,46 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 1. 配置跨域資源共享 (CORS)
-# 外掛開發中，由於請求來自瀏覽器擴充套件環境，必須正確配置 CORS
+# 1. CORS：正式環境前端由 nginx 同源反向代理 /api，不需要跨域；這裡只放行開發用的
+#    Vite dev server（npm run dev，預設 http://localhost:5173）。以逗號分隔設定 CORS_ORIGINS。
+_CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生產環境建議指定外掛的 ID 或具體域名
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. 掛載路由
-# /api/v1
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@app.middleware("http")
+async def reject_cross_site_writes(request: Request, call_next):
+    """CSRF 防護：身分放在 cookie，瀏覽器會自動帶上，所以要擋「別的網站代替使用者送出的寫入請求」。
+
+    cookie 已設 SameSite=Lax（跨站 POST 不帶 cookie），這裡再檢查 Origin 當第二層：
+    瀏覽器送出跨站寫入時一定帶 Origin，主機名稱不是自己、也不在 CORS 白名單就拒絕。
+    沒有 Origin（curl、伺服器對伺服器）不在 CSRF 的威脅範圍內，放行。
+    nginx 轉送的 Host 不含 port，所以只比主機名稱。
+    """
+    origin = request.headers.get("origin")
+    if request.method in _UNSAFE_METHODS and origin and origin not in _CORS_ORIGINS:
+        host = urlsplit("//" + (request.headers.get("host") or "")).hostname
+        if urlsplit(origin).hostname != host:
+            return JSONResponse(status_code=403, content={"detail": "不允許跨站請求"})
+    return await call_next(request)
+
+# 2. 掛載路由（前端是獨立的 React 專案 frontend/，不再由 FastAPI 提供靜態檔）
+app.include_router(auth_api.router, prefix="/api/v1", tags=["認證"])
 app.include_router(chat.router, prefix="/api/v1", tags=["對話"])
-# /api/v1
 app.include_router(oss.router, prefix="/api/v1", tags=["GCS 預簽名上傳"])
 
-# 3. 掛載前端資源
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.exists(static_dir):
-    app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
 
-# 前端 fallback 路由 - 只處理非 API 請求
-# /{path:path}
-@app.get("/{path:path}", include_in_schema=False)
-async def serve_frontend(path: str):
-    # 排除 API 路徑
-    if path.startswith("api/"):
-        return JSONResponse(content={"error": "Not Found"}, status_code=404)
-    
-    # 如果請求的是靜態檔案，直接返回
-    file_path = os.path.join(static_dir, path)
-    if os.path.isfile(file_path):
-        return FileResponse(file_path)
-    
-    # 否則返回 index.html (SPA fallback)
-    index_path = os.path.join(static_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    
-    return {"message": "你的獨傢俬廚上線了~", "status": "ok"}
+@app.get("/api/health", include_in_schema=False)
+async def health():
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn

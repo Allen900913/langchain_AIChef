@@ -45,7 +45,7 @@ async def _seed(case: dict[str, Any]) -> None:
                          {"content": case["seed_diet"]})
 
     if case.get("seed_inventory") is not None:
-        # inventory_get 讀的是 ("inventory", user_id) 的 "items" → value["items"]
+        # inventory（action=get）讀的是 ("inventory", user_id) 的 "items" → value["items"]
         await store.aput(("inventory", user_id), "items", {
             "items": sorted(set(case["seed_inventory"])),
             "updated_at": datetime.now(timezone.utc).isoformat(),

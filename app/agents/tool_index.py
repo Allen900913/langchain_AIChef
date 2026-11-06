@@ -2,11 +2,11 @@
 dense（bge-small-zh）+ BM25 sparse 混合檢索、RRF 融合，選出與當前查詢最相關的工具。
 
 規模說明（務必知道）：這套 Query Rewrite + Hybrid Search + RRF + Qdrant 管線是為
-「工具多到塞不進 context」（上百上千個）的規模設計的。本專案只有 14 個工具，
+「工具多到塞不進 context」（上百上千個）的規模設計的。本專案只有 12 個工具，
 其實把全部工具丟給模型就夠了；這裡完整實作純為練習這條業界標準管線。
 
 管線分工：
-- 索引（一次性）：每個工具 = 一個 Qdrant point，payload 存工具名，
+- 索引（一次性）：每個工具 = 一個 Qdrant point，payload 存工具名與被 embed 的文字，
   同時存 dense 向量（語意）與 bm25 sparse 向量（字面）。
 - 查詢（每輪）：對「重寫後的查詢字串」同時做 dense + bm25 檢索，
   用 Qdrant 原生的 RRF 融合兩份排名，回傳 Top-K 工具名。
@@ -16,11 +16,7 @@ BM25 用 Qdrant 的 IDF modifier：fastembed 只產原始詞頻，IDF 由 Qdrant
 """
 
 import asyncio
-import os
 import sys
-from functools import lru_cache
-
-from dotenv import load_dotenv
 
 # 以 -m 獨立執行時不會經過 app.py 的 stdout reconfigure，cp950 終端機印 emoji 會炸。
 # 同樣在此保護，確保 ensure_index 的 print 不中斷索引流程。
@@ -31,37 +27,21 @@ for _stream in (sys.stdout, sys.stderr):
         except (AttributeError, ValueError):
             pass
 
-# tools.py 匯入時會實例化 TavilySearch（需 TAVILY_API_KEY）；直接以 -m 執行本模組
-# 時不會經過 app.py 的 load_dotenv，故在匯入 tools 前先載入 .env（重複呼叫無害）。
-load_dotenv()
+from qdrant_client import QdrantClient, models
 
-from qdrant_client import AsyncQdrantClient, QdrantClient, models
-from fastembed import SparseTextEmbedding, TextEmbedding
-
+# app.common.qdrant 在 import 時載入 .env 並讀 QDRANT_URL / QDRANT_API_KEY（直接以 -m 執行也適用）
+from app.common.qdrant import QDRANT_API_KEY, QDRANT_URL, get_async_client
+from app.agents.embedding import (
+    DENSE_VEC,
+    SPARSE_VEC,
+    embed_passages_sync,
+    embed_query_sync,
+    sparse_vectors_config,
+    vectors_config,
+)
 from app.agents.tools import ALL_TOOLS
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6397")
 COLLECTION = "chef_tools"
-
-# 中文專用、512 維、僅 90MB：工具 description 全是中文，用中文模型召回優於多語通用模型。
-DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
-DENSE_DIM = 512
-SPARSE_MODEL = "Qdrant/bm25"
-
-DENSE_VEC = "dense"
-SPARSE_VEC = "bm25"
-
-
-# fastembed 模型單例（首次載入含下載，之後走本地快取）。onnxruntime CPU 推論，
-# 單條短字串約數十毫秒；查詢路徑會用 asyncio.to_thread 包起來避免阻塞事件迴圈。
-@lru_cache(maxsize=1)
-def _dense_model() -> TextEmbedding:
-    return TextEmbedding(DENSE_MODEL)
-
-
-@lru_cache(maxsize=1)
-def _sparse_model() -> SparseTextEmbedding:
-    return SparseTextEmbedding(SPARSE_MODEL)
 
 
 def _tool_text(tool) -> str:
@@ -71,14 +51,6 @@ def _tool_text(tool) -> str:
     return f"{tool.name}：{desc}"
 
 
-def _to_sparse_vector(sparse_embedding) -> models.SparseVector:
-    """fastembed 的 SparseEmbedding → Qdrant SparseVector。"""
-    return models.SparseVector(
-        indices=sparse_embedding.indices.tolist(),
-        values=sparse_embedding.values.tolist(),
-    )
-
-
 # ==============================================================================
 # 索引建立（一次性 / 冪等）
 # ==============================================================================
@@ -86,48 +58,33 @@ def _to_sparse_vector(sparse_embedding) -> models.SparseVector:
 def ensure_index(force: bool = False) -> None:
     """建立或補齊 chef_tools collection（同步，供啟動時與 __main__ 呼叫）。
 
-    冪等：collection 已存在且點數等於工具數就直接返回（不重建）；force=True 強制重建。
+    冪等：collection 已存在、而且裡面每個工具的名稱與 description 都跟程式一致就直接返回（不重建）；
+    工具增減、改名或只改了 description 都會重建。force=True 強制重建。
     用同步 QdrantClient——這是啟動階段的一次性動作，不需要非同步，也避開事件迴圈細節。
     """
-    client = QdrantClient(url=QDRANT_URL)
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     try:
         exists = client.collection_exists(COLLECTION)
         if exists and not force:
-            count = client.count(COLLECTION).count
-            if count == len(ALL_TOOLS):
-                print(f"🧭 [TOOL-INDEX] {COLLECTION} 已就緒（{count} 個工具），跳過重建")
+            points, _ = client.scroll(COLLECTION, limit=len(ALL_TOOLS) + 100, with_payload=True)
+            indexed = sorted((p.payload.get("name"), p.payload.get("text")) for p in points)
+            if indexed == sorted((t.name, _tool_text(t)) for t in ALL_TOOLS):
+                print(f"🧭 [TOOL-INDEX] {COLLECTION} 已就緒（{len(points)} 個工具），跳過重建")
                 return
-            print(f"🧭 [TOOL-INDEX] 點數不符（{count} != {len(ALL_TOOLS)}），重建")
+            print(f"🧭 [TOOL-INDEX] 工具名稱或 description 有變（索引 {len(points)} 個、程式 {len(ALL_TOOLS)} 個），重建")
 
         if exists:
             client.delete_collection(COLLECTION)
 
         client.create_collection(
             COLLECTION,
-            vectors_config={
-                DENSE_VEC: models.VectorParams(
-                    size=DENSE_DIM, distance=models.Distance.COSINE
-                ),
-            },
-            # IDF modifier：bm25 的 IDF 權重由 Qdrant 檢索時計算（fastembed 只給詞頻）
-            sparse_vectors_config={
-                SPARSE_VEC: models.SparseVectorParams(modifier=models.Modifier.IDF),
-            },
+            vectors_config=vectors_config(),
+            sparse_vectors_config=sparse_vectors_config(),
         )
 
-        texts = [_tool_text(t) for t in ALL_TOOLS]
-        dense_vecs = list(_dense_model().passage_embed(texts))
-        sparse_vecs = list(_sparse_model().embed(texts))
-
+        vectors = embed_passages_sync([_tool_text(t) for t in ALL_TOOLS])
         points = [
-            models.PointStruct(
-                id=i,
-                vector={
-                    DENSE_VEC: dense_vecs[i].tolist(),
-                    SPARSE_VEC: _to_sparse_vector(sparse_vecs[i]),
-                },
-                payload={"name": tool.name},
-            )
+            models.PointStruct(id=i, vector=vectors[i], payload={"name": tool.name, "text": _tool_text(tool)})
             for i, tool in enumerate(ALL_TOOLS)
         ]
         client.upsert(COLLECTION, points=points)
@@ -140,27 +97,15 @@ def ensure_index(force: bool = False) -> None:
 # 查詢（每輪 / 非同步）
 # ==============================================================================
 
-_async_client: AsyncQdrantClient | None = None
+def exclude_filter(names) -> models.Filter | None:
+    """排除指定工具的 Qdrant filter（基底工具每輪都在，不該佔檢索名額）。"""
+    if not names:
+        return None
+    return models.Filter(must_not=[models.FieldCondition(key="name", match=models.MatchAny(any=list(names)))])
 
 
-def _get_async_client() -> AsyncQdrantClient:
-    """延遲建立 AsyncQdrantClient 單例（須在事件迴圈內首次呼叫）。"""
-    global _async_client
-    if _async_client is None:
-        _async_client = AsyncQdrantClient(url=QDRANT_URL)
-    return _async_client
-
-
-def _embed_query_sync(query: str) -> tuple[list[float], models.SparseVector]:
-    """對查詢字串同時產 dense + bm25 sparse 向量（用 query 端方法，非對稱檢索）。
-    bge 的 query_embed 會自動加上查詢指令前綴；bm25 的 query_embed 產查詢側詞權重。"""
-    dense = list(_dense_model().query_embed(query))[0].tolist()
-    sparse = _to_sparse_vector(list(_sparse_model().query_embed(query))[0])
-    return dense, sparse
-
-
-async def retrieve_tool_names(query: str, limit: int = 5) -> list[str]:
-    """Hybrid Search + RRF：回傳與 query 最相關的 Top-K 工具名（依融合分數高到低）。
+async def retrieve_tool_names(query: str, limit: int = 5, exclude=()) -> list[str]:
+    """Hybrid Search + RRF：回傳與 query 最相關的 Top-K 工具名（依融合分數高到低），不含 exclude 裡的工具。
 
     失敗時回傳空 list——由 router 用基底工具兜底，不讓檢索故障中斷整輪對話。
     """
@@ -169,13 +114,14 @@ async def retrieve_tool_names(query: str, limit: int = 5) -> list[str]:
         return []
     try:
         # fastembed 是 CPU 同步推論，丟進執行緒避免阻塞事件迴圈
-        dense_q, sparse_q = await asyncio.to_thread(_embed_query_sync, query)
-        client = _get_async_client()
+        dense_q, sparse_q = await asyncio.to_thread(embed_query_sync, query)
+        client = get_async_client()
+        flt = exclude_filter(exclude)
         result = await client.query_points(
             COLLECTION,
             prefetch=[
-                models.Prefetch(query=dense_q, using=DENSE_VEC, limit=limit * 2),
-                models.Prefetch(query=sparse_q, using=SPARSE_VEC, limit=limit * 2),
+                models.Prefetch(query=dense_q, using=DENSE_VEC, limit=limit * 2, filter=flt),
+                models.Prefetch(query=sparse_q, using=SPARSE_VEC, limit=limit * 2, filter=flt),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=limit,

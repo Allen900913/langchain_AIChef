@@ -1337,3 +1337,356 @@ body {
 }
 
 
+
+
+/* =============================================
+   React 版新增：停止鈕、排隊徽章、審核卡結果
+   ============================================= */
+
+.task-turn {
+  display: contents;
+}
+
+.stop-btn {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  cursor: pointer;
+  font-size: 14px;
+  min-width: 38px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-normal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stop-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.28);
+}
+
+.stop-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.message.user.is-queued .message-content {
+  opacity: 0.6;
+}
+
+.queue-badge {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.queue-withdraw {
+  background: none;
+  border: 1px solid var(--border-secondary);
+  color: var(--text-secondary);
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.queue-withdraw:hover {
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #f87171;
+}
+
+.banner-info {
+  background: rgba(155, 151, 176, 0.08);
+  border: 1px solid var(--border-secondary);
+  color: var(--text-secondary);
+}
+
+.hitl-card.hitl-closed {
+  opacity: 0.75;
+  border-color: var(--border-secondary);
+  box-shadow: none;
+}
+
+.hitl-result {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.hitl-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.typing-indicator.inline {
+  padding: 6px 0;
+}
+
+.badge-awaiting {
+  background: rgba(168, 85, 247, 0.15);
+  color: var(--text-accent);
+  border: 1px solid rgba(168, 85, 247, 0.35);
+}
+
+.badge-skipped {
+  background: rgba(155, 151, 176, 0.1);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-secondary);
+}
+
+.tool-item.status-awaiting {
+  border-color: rgba(168, 85, 247, 0.35);
+}
+
+.tool-item.status-skipped {
+  opacity: 0.6;
+}
+
+/* =============================================
+   Auth（登入 / 註冊頁、側邊欄帳號區）
+   ============================================= */
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: var(--bg-primary);
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  padding: 32px 28px;
+  background: var(--gradient-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), var(--shadow-glow);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-logo {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  border-radius: var(--radius-md);
+  background: var(--gradient-primary);
+}
+
+.auth-title {
+  margin: 4px 0 0;
+  text-align: center;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.auth-subtitle {
+  margin: 0 0 6px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.auth-field input {
+  padding: 11px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.auth-field input:focus {
+  border-color: var(--accent-primary);
+}
+
+.auth-error {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+.auth-submit {
+  margin-top: 4px;
+  padding: 12px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--gradient-primary);
+  color: white;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.auth-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.auth-switch {
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.auth-switch a,
+.auth-guest {
+  color: var(--text-accent);
+  text-decoration: none;
+}
+
+.auth-switch a {
+  margin-left: 4px;
+}
+
+.auth-switch a:hover,
+.auth-guest:hover {
+  text-decoration: underline;
+}
+
+.auth-guest {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* 側邊欄：帳號區 */
+.account-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+}
+
+.account-avatar {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  background: var(--gradient-primary);
+  color: white;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.account-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.account-name,
+.account-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-name {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.account-email {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.account-logout,
+.guest-btn {
+  padding: 6px 12px;
+  background: none;
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.account-logout:hover,
+.guest-btn:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+
+.guest-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+}
+
+.guest-notice {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.guest-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.guest-btn {
+  flex: 1;
+}
+
+.guest-btn.primary {
+  background: var(--gradient-primary);
+  border-color: transparent;
+  color: white;
+}
+
+/* =============================================
+   Summary Note（較早的對話壓縮成的摘要）
+   ============================================= */
+
+.summary-note {
+  margin: 0 0 24px;
+}
+
+.summary-content {
+  font-size: 14px;
+  color: var(--text-secondary);
+}

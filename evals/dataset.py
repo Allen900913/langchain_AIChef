@@ -23,7 +23,7 @@ EVAL_CASES: list[dict[str, Any]] = [
         "user_id": "eval_peanut",
         "seed_diet": {"allergies": ["花生", "花生醬"], "dislikes": [], "diet_type": None},
         "seed_inventory": ["雞胸肉", "青椒", "洋蔥", "白米"],
-        "expected_tools": ["profiles_get", "inventory_get", "web_search"],
+        "expected_tools": ["profiles_get", "inventory", "web_search"],
         "allergens": ["花生"],
     },
     {
@@ -32,7 +32,7 @@ EVAL_CASES: list[dict[str, Any]] = [
         "user_id": "eval_veg",
         "seed_diet": {"allergies": [], "dislikes": [], "diet_type": "vegetarian"},
         "seed_inventory": ["豆腐", "花椰菜", "番茄", "雞蛋"],
-        "expected_tools": ["profiles_get", "inventory_get", "web_search"],
+        "expected_tools": ["profiles_get", "inventory", "web_search"],
         "allergens": ["豬肉", "牛肉", "雞肉", "鮭魚"],
     },
     {
@@ -50,7 +50,7 @@ EVAL_CASES: list[dict[str, Any]] = [
         "user_id": "eval_inv",
         "seed_diet": None,
         "seed_inventory": ["雞蛋", "高麗菜", "豆腐"],
-        "expected_tools": ["inventory_get"],
+        "expected_tools": ["inventory"],
         "allergens": [],
     },
     {
@@ -68,7 +68,7 @@ EVAL_CASES: list[dict[str, Any]] = [
         "user_id": "eval_steps",
         "seed_diet": None,
         "seed_inventory": ["雞胸肉", "蒜頭"],
-        "expected_tools": ["web_search", "step_tracker_start"],
+        "expected_tools": ["web_search", "step_tracker"],
         "allergens": [],
     },
     {
@@ -77,7 +77,7 @@ EVAL_CASES: list[dict[str, Any]] = [
         "user_id": "eval_seafood",
         "seed_diet": {"allergies": ["蝦", "螃蟹", "帶殼海鮮"], "dislikes": [], "diet_type": None},
         "seed_inventory": ["雞蛋", "番茄", "洋蔥", "白米"],
-        "expected_tools": ["profiles_get", "inventory_get", "web_search"],
+        "expected_tools": ["profiles_get", "inventory", "web_search"],
         "allergens": ["蝦", "螃蟹"],
     },
     {

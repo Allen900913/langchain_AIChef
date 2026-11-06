@@ -1,0 +1,12 @@
+.git
+# 前端是獨立映像（frontend/Dockerfile），後端映像不需要
+frontend
+.venv
+**/__pycache__
+.env
+# 金鑰不進映像檔，由 docker-compose 以唯讀 volume 掛入
+app/*-b2-*.json
+*service-account*.json
+*-key.json
+evals
+test_*.py

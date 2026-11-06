@@ -1,33 +1,139 @@
 services:
   # ==============================================================
-  # AI Chef 既有服務（保持不動）
+  # 資料服務：postgres / qdrant / redis
+  #   - 密碼與 API key 一律從 .env 讀（${VAR:?} 沒設定就拒絕啟動），不寫在這份會進 git 的檔案裡
+  #   - 對外的 port 只綁 127.0.0.1，給本機直接跑 API / worker / 測試用；容器之間走 compose 內部網路，
+  #     不經過這些 port。區網或外網的其他機器連不到
   # ==============================================================
   postgres:
     image: postgres:15
     container_name: postgres-ai-chef
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: zxcv65428
+      # 只在資料目錄第一次初始化時生效；既有 volume 要換密碼得用 ALTER USER（見 README）
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?請在 .env 設定 POSTGRES_PASSWORD}
       POSTGRES_DB: ai_memory
     ports:
-      - "5487:5432"
+      - "127.0.0.1:5487:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant
+    # 鎖版本：不帶 tag 等於 latest，重建時可能被動升級
+    image: qdrant/qdrant:v1.19.0
     container_name: qdrant-ai-chef
+    environment:
+      # 設了之後每個請求都要帶 api-key header（程式從 QDRANT_API_KEY 讀，見 tool_index.py）
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?請在 .env 設定 QDRANT_API_KEY}
+    # 只開 REST（6333）；gRPC（6334）程式沒用到，不對外
     ports:
-      - "6397:6333"
-      - "6398:6334"
+      - "127.0.0.1:6397:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # ==============================================================
+  # 非同步任務架構：API（收任務 + SSE）與 Agent worker 分離，以 Redis 串接
+  #   - Redis Streams 同時當任務佇列（consumer group）與每個任務的事件串流
+  #   - 6379 已被 langfuse 的 redis 佔用，對外改開 6389（本機直接跑 API/worker 時用）
+  # ==============================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis-ai-chef
+    # requirepass：Redis 預設不驗證，任何連得到的人都能讀寫任務與事件串流
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?請在 .env 設定 REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6389:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8741"]
+    env_file: .env
+    environment: &container_env
+      # .env 裡的位址是給本機直接執行用的（localhost），容器內改指向 compose 服務名
+      DB_URI: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/ai_memory
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      LANGFUSE_BASE_URL: http://host.docker.internal:3000
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcs-key.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # GCS 金鑰以唯讀方式掛入，不打包進映像檔（路徑取自 .env 的 GOOGLE_APPLICATION_CREDENTIALS）
+      - ./${GOOGLE_APPLICATION_CREDENTIALS}:/run/secrets/gcs-key.json:ro
+    # 只綁本機：外部一律經過 proxy（HTTPS）。保留這個 port 是給本機 Vite 開發伺服器代理用
+    ports:
+      - "127.0.0.1:8741:8741"
+    depends_on:
+      - postgres
+      - redis
+      # 刪除對話時要一起刪掉向量庫裡的對話紀錄
+      - qdrant
+    restart: unless-stopped
+
+  # 前端（React）：nginx 提供打包後的靜態檔，並把 /api 同源代理到 api 服務
+  # 對外由 proxy 提供 HTTPS；8080 只綁本機，方便除錯時繞過 proxy 直接看 nginx
+  # 開發時改用 cd frontend && npm run dev（http://localhost:5173）
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # 對外唯一入口（HTTPS）：Caddy 自動申請 / 續期憑證、把 http 轉址到 https，內部用 HTTP 轉給 web
+  # 開啟 https://localhost 使用；網域由 .env 的 SITE_ADDRESS 決定（見 Caddyfile）
+  proxy:
+    image: caddy:2.10-alpine
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 憑證與私鑰（含本機 CA）存在 volume：重建容器不必重新申請，也不會撞 Let's Encrypt 的次數限制
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  # 可水平擴充：docker compose up -d --scale worker=3
+  # （不設 container_name，否則無法 scale）
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      <<: *container_env
+      WORKER_CONCURRENCY: "4"
+      FASTEMBED_CACHE_PATH: /cache/fastembed
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - fastembed_cache:/cache/fastembed
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    # 收到 SIGTERM 後停止接單、等進行中任務跑完（agent 上限 120 秒 + 收尾）
+    stop_grace_period: 180s
     restart: unless-stopped
 
 volumes:
   postgres_data:
   qdrant_data:
+  redis_data:
+  fastembed_cache:
+  caddy_data:
+  caddy_config:
   # 以下 langfuse_* volume 是歷史殘留：langfuse 請改用官方 repo 部署
   #   git clone https://github.com/langfuse/langfuse.git && cd langfuse && docker compose up -d
   # 不要把 langfuse 的服務寫回這份 compose，版本相依很容易撞。

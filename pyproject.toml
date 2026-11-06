@@ -25,6 +25,9 @@ dependencies = [
     "qdrant-client[fastembed]>=1.18.0",
     "langfuse>=4.15.1",
     "e2b-code-interpreter>=2.10.0",
+    "redis>=5.2",
+    "pyjwt>=2.9",
+    "pwdlib[argon2]>=0.2.1",
 ]
 
 [dependency-groups]
