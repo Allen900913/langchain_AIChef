@@ -790,6 +790,10 @@ body {
   margin-top: 10px;
 }
 
+.input-hint.is-over-limit {
+  color: #fca5a5;
+}
+
 /* --- Toast Notification --- */
 .toast-container {
   position: fixed;

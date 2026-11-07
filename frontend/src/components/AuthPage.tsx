@@ -54,7 +54,7 @@ export default function AuthPage({ mode }: { mode: 'login' | 'register' }) {
         )}
         <label className="auth-field">
           <span>Email</span>
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" autoFocus />
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required maxLength={254} autoComplete="email" autoFocus />
         </label>
         <label className="auth-field">
           <span>密碼{isRegister && '（至少 8 個字元）'}</span>

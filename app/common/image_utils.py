@@ -15,6 +15,8 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 # Base64 會膨脹 4/3 倍，原圖 2.5MB → 約 3.3MB，加上提示詞仍在上限內
 MAX_DATA_URL_IMAGE_BYTES = int(2.5 * 1024 * 1024)
 MAX_DATA_URL_LEN = 64 + (MAX_DATA_URL_IMAGE_BYTES + 2) // 3 * 4
+# GCS 簽名 URL 通常不到 2,000 字元，超過這個長度的一定不是 /gcs/presign 產生的
+MAX_IMAGE_URL_LEN = 4096
 
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 GCS_HOST = "storage.googleapis.com"
@@ -64,6 +66,8 @@ def check_message_image_url(url: str, user_id: str | None, bucket: str | None) -
             return "圖片內容與宣告的類型不符"
         return None
 
+    if len(url) > MAX_IMAGE_URL_LEN:
+        return "圖片網址無效，請重新上傳"
     parts = urlsplit(url)
     if (
         user_id is None

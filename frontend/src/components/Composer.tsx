@@ -3,6 +3,10 @@ import { api, newIdempotencyKey } from '../api';
 import { useAuth } from '../auth';
 import { useToast } from './Toast';
 
+// 與後端 app/models/schemas.py 的 MESSAGE_MAX_CHARS 一致
+const MESSAGE_MAX_CHARS = 2000;
+const MESSAGE_COUNTER_FROM = 1600;
+
 /**
  * 輸入區。回覆進行中仍可送出（後端排隊），旁邊多一顆停止鈕：
  * 想「打斷再說」就先按停止，再送出新訊息。
@@ -35,7 +39,9 @@ export default function Composer({
     el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
   }, [text]);
 
-  const canSend = (text.trim().length > 0 || !!image) && !uploading;
+  const length = text.trim().length;
+  const tooLong = length > MESSAGE_MAX_CHARS;
+  const canSend = (length > 0 || !!image) && !uploading && !tooLong;
 
   async function submit() {
     if (!canSend) return;
@@ -131,8 +137,13 @@ export default function Composer({
             </button>
           </div>
         </div>
-        <div className="input-hint">
-          按 Ctrl + Enter 送出 · 回覆中可繼續送出（自動排隊）或按 ■ 停止 · 支援圖片上傳
+        {/* 不用 textarea 的 maxLength：它會默默截斷貼上的文字，使用者不會發現後面不見了 */}
+        <div className={`input-hint${tooLong ? ' is-over-limit' : ''}`} data-testid="input-hint">
+          {tooLong
+            ? `訊息太長（${length} / ${MESSAGE_MAX_CHARS} 字），請縮短後再送出`
+            : length >= MESSAGE_COUNTER_FROM
+              ? `${length} / ${MESSAGE_MAX_CHARS} 字`
+              : '按 Ctrl + Enter 送出 · 回覆中可繼續送出（自動排隊）或按 ■ 停止 · 支援圖片上傳'}
         </div>
       </div>
       <input type="file" ref={fileRef} accept="image/*" onChange={pickImage} style={{ display: 'none' }} />

@@ -3,8 +3,10 @@
 三種 token，全部放在 httpOnly cookie（JavaScript 讀不到，XSS 偷不走；EventSource 也會自動帶上）：
 
 - access token：JWT，15 分鐘。每個請求用它認人，驗簽即可，不查資料庫。
-- refresh token：隨機字串，30 天。資料庫只存 SHA-256 雜湊；每用一次就換一張新的（rotation），
-  登出時撤銷。舊 token 在寬限期後又被拿來用 → 視為外洩，撤銷該使用者全部 refresh token。
+- refresh token：隨機字串。資料庫只存 SHA-256 雜湊；每用一次就換一張新的（rotation），登出時撤銷。
+  兩個期限：閒置 7 天沒換發就過期（每次換發往後推）；從輸入密碼算起 30 天一定過期（換發只繼承、不延長），
+  所以 token 被偷後，就算一直換發也撐不過這個期限，時間到必須重新輸入密碼。舊 token 在寬限期內重送只換 access token（不開第二條鏈）；超過寬限期又出現 → 視為外洩，
+  撤銷該使用者全部 refresh token。
 - guest token：JWT，訪客 session（sub = guest:<hex>），沒有密碼、不進 users 表、伺服器不存任何
   訪客資料。它只用來確認「看這個事件串流 / 停止這個任務的人，就是送出訊息的人」。
 """
@@ -26,13 +28,17 @@ from app.services import db
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TTL = timedelta(minutes=int(os.getenv("ACCESS_TOKEN_MINUTES", "15")))
-REFRESH_TTL = timedelta(days=int(os.getenv("REFRESH_TOKEN_DAYS", "30")))
+REFRESH_TTL = timedelta(days=int(os.getenv("REFRESH_TOKEN_DAYS", "7")))  # 閒置期限
+REFRESH_ABSOLUTE_TTL = timedelta(days=int(os.getenv("REFRESH_ABSOLUTE_DAYS", "30")))  # 從登入算起的絕對期限
 GUEST_TTL = timedelta(hours=int(os.getenv("GUEST_TTL_HOURS", "24")))
-# 多分頁同時用同一張 refresh token 換發時，第二個請求不算外洩
-REFRESH_REUSE_GRACE = timedelta(seconds=30)
+# 多分頁同時用同一張 refresh token 換發時，第二個請求不算外洩。
+# 只需要涵蓋「請求還在路上」的時間：回應一回來，瀏覽器之後送的就是新 cookie，所以不用太長。
+REFRESH_REUSE_GRACE = timedelta(seconds=10)
 
 GUEST_PREFIX = "guest:"
 PASSWORD_MIN, PASSWORD_MAX = 8, 128
+EMAIL_MAX = 254
+DISPLAY_NAME_MAX = 50
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _hasher = PasswordHash.recommended()  # Argon2id
@@ -116,7 +122,9 @@ def decode_token(token: str, typ: str) -> TokenClaims | None:
 
 def normalize_email(email: str) -> str:
     email = (email or "").strip().lower()
-    if not _EMAIL_RE.match(email) or len(email) > 254:
+    # 先檢查長度：這個 regex 遇到特製的長字串（例如大量連續的點）耗時會隨長度平方成長，
+    # 而且跑在 event loop 上，卡住時所有請求都要等
+    if len(email) > EMAIL_MAX or not _EMAIL_RE.match(email):
         raise AuthError("Email 格式不正確")
     return email
 
@@ -133,7 +141,7 @@ def public_user(row: dict) -> dict:
 async def create_user(email: str, password: str, display_name: str | None = None) -> dict:
     email = normalize_email(email)
     validate_password(password)
-    display_name = (display_name or "").strip()[:50] or None
+    display_name = (display_name or "").strip()[:DISPLAY_NAME_MAX] or None
     # Argon2 一次約數十毫秒的 CPU，丟到執行緒池，不卡住 event loop 上的 SSE
     password_hash = await asyncio.to_thread(_hasher.hash, password)
     try:
@@ -189,53 +197,71 @@ def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-async def issue_refresh_token(user_id) -> str:
+async def _insert_refresh_token(conn, user_id, absolute_expires_at: datetime) -> str:
+    """閒置期限不能超過絕對期限：快到期時發的 token 只活到絕對期限為止。"""
     raw = secrets.token_urlsafe(48)
-    async with db.get_pool().connection() as conn:
-        await conn.execute(
-            "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (%s, %s, %s, %s)",
-            (uuid.uuid4(), user_id, _hash_token(raw), _now() + REFRESH_TTL),
-        )
+    await conn.execute(
+        "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, absolute_expires_at)"
+        " VALUES (%s, %s, %s, %s, %s)",
+        (uuid.uuid4(), user_id, _hash_token(raw), min(_now() + REFRESH_TTL, absolute_expires_at), absolute_expires_at),
+    )
     return raw
 
 
-async def rotate_refresh_token(raw: str) -> tuple[dict, str]:
-    """用舊 refresh token 換一張新的，回傳 (使用者, 新 token)。失敗拋 AuthError(401)。"""
+async def issue_refresh_token(user_id) -> str:
+    """登入用：輸入過密碼，絕對期限從現在重新起算。"""
+    async with db.get_pool().connection() as conn:
+        return await _insert_refresh_token(conn, user_id, _now() + REFRESH_ABSOLUTE_TTL)
+
+
+async def rotate_refresh_token(raw: str) -> tuple[dict, str | None]:
+    """用 refresh token 換發，回傳 (使用者, 新 refresh token)。失敗拋 AuthError(401)。
+
+    - 超過閒置期限或絕對期限：拒絕。只影響這條鏈，其他裝置的登入不受影響。
+    - 第一次使用：換一張新的，繼承原本的絕對期限。
+    - 寬限期內重送（例如多分頁同時換發）：新 token 回 None，呼叫端只發 access token。
+      不再發第二張 refresh token，同一個登入就不會分叉成兩條互不相干的鏈；
+      就算先換發的是駭客，使用者之後再用這張舊 token 時也一定會被偵測到。
+    - 超過寬限期又出現：視為外洩，撤銷這個使用者全部 refresh token。
+    - 已被撤銷（登出或偵測到外洩）：一律拒絕，沒有寬限。
+    """
     reused = False
+    new_raw = None
     async with db.get_pool().connection() as conn:
         async with conn.transaction():
             cur = await conn.execute(
-                "SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens"
+                "SELECT id, user_id, expires_at, absolute_expires_at, rotated_at, revoked_at FROM refresh_tokens"
                 " WHERE token_hash = %s FOR UPDATE",
                 (_hash_token(raw),),
             )
             row = await cur.fetchone()
-            if row is None or row["expires_at"] <= _now():
+            if row is None or min(row["expires_at"], row["absolute_expires_at"]) <= _now():
                 raise AuthError("登入已過期，請重新登入", status_code=401)
             if row["revoked_at"] is not None:
-                if _now() - row["revoked_at"] > REFRESH_REUSE_GRACE:
-                    # 已換發過的 token 又出現：可能被偷了，讓這個使用者所有裝置都重新登入。
-                    # 這裡不能直接 raise：例外會讓交易回滾，撤銷就白做了
-                    await conn.execute(
-                        "UPDATE refresh_tokens SET revoked_at = now()"
-                        " WHERE user_id = %s AND revoked_at IS NULL",
-                        (row["user_id"],),
-                    )
-                    reused = True
+                raise AuthError("登入已失效，請重新登入", status_code=401)
+            rotated_at = row["rotated_at"]
+            if rotated_at is not None and _now() - rotated_at > REFRESH_REUSE_GRACE:
+                # 已換發過的 token 又出現：可能被偷了，讓這個使用者所有裝置都重新登入。
+                # 這裡不能直接 raise：例外會讓交易回滾，撤銷就白做了
+                await conn.execute(
+                    "UPDATE refresh_tokens SET revoked_at = now()"
+                    " WHERE user_id = %s AND revoked_at IS NULL",
+                    (row["user_id"],),
+                )
+                reused = True
             else:
-                await conn.execute("UPDATE refresh_tokens SET revoked_at = now() WHERE id = %s", (row["id"],))
-            if not reused:
                 cur = await conn.execute(
                     "SELECT id, email, display_name FROM users WHERE id = %s", (row["user_id"],)
                 )
                 user = await cur.fetchone()
                 if user is None:
                     raise AuthError("帳號不存在", status_code=401)
-                new_raw = secrets.token_urlsafe(48)
-                await conn.execute(
-                    "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (%s, %s, %s, %s)",
-                    (uuid.uuid4(), user["id"], _hash_token(new_raw), _now() + REFRESH_TTL),
-                )
+                if rotated_at is None:
+                    # 寫入和比對都用應用程式的時間，寬限期才不會受資料庫時鐘差影響
+                    await conn.execute(
+                        "UPDATE refresh_tokens SET rotated_at = %s WHERE id = %s", (_now(), row["id"])
+                    )
+                    new_raw = await _insert_refresh_token(conn, user["id"], row["absolute_expires_at"])
     if reused:
         raise AuthError("登入已失效，請重新登入", status_code=401)
     return user, new_raw

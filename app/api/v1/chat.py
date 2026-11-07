@@ -28,7 +28,8 @@ import uuid
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.api.deps import Principal, optional_principal, owned_thread, principal_or_new_guest, require_principal
+from app.api.deps import Principal, client_ip, optional_principal, owned_thread, principal_or_new_guest, require_principal
+from app.common import rate_limit
 from app.common import task_queue as tq
 from app.common.qdrant import delete_thread_turns
 from app.common.image_utils import (
@@ -101,9 +102,20 @@ async def _replay_chat_task(earlier: dict, fingerprint: str, ephemeral: bool) ->
     }
 
 
+def _rate_limited(wait_seconds: int) -> HTTPException:
+    if wait_seconds <= 60:
+        message = f"訊息送得太快了，請 {wait_seconds} 秒後再試"
+    elif wait_seconds < 3600:
+        message = f"訊息額度已用完，請約 {wait_seconds // 60 + 1} 分鐘後再試"
+    else:
+        message = f"今天的訊息額度已用完，請約 {wait_seconds // 3600 + 1} 小時後再試"
+    return HTTPException(status_code=429, detail=message, headers={"Retry-After": str(wait_seconds)})
+
+
 @router.post("/chat/tasks", status_code=202)
 async def create_chat_task(
     request: ChatRequest,
+    http_request: Request,
     principal: Principal = Depends(principal_or_new_guest),
     idempotency_key: str | None = Header(default=None, pattern=r"^[A-Za-z0-9_-]{16,128}$"),
 ):
@@ -118,6 +130,9 @@ async def create_chat_task(
     Idempotency-Key：key 代表「這一次發送」，不是訊息內容。回應在途中遺失時，前端用同一個 key 重送，
     這裡回傳原本的任務（replayed = true）；使用者重新發一則相同的文字是新的 key，照常建立任務。
     key 依使用者分開存，別人用同一個 key 拿不到你的任務。
+
+    速率限制：訪客看 IP，登入使用者看 user_id，超過回 429 + Retry-After。重送不扣額度（前面就回傳了），
+    被擋下時會釋放 Idempotency-Key，使用者稍後用同一個 key 重送才不會卡住。
     """
     if request.image_url:
         error = check_message_image_url(
@@ -156,6 +171,13 @@ async def create_chat_task(
         payload["ephemeral"] = True
     thread_created = False
     try:
+        wait_seconds = await rate_limit.hit(
+            r,
+            f"ip:{client_ip(http_request)}" if principal.is_guest else f"user:{principal.id}",
+            rate_limit.GUEST_LIMITS if principal.is_guest else rate_limit.USER_LIMITS,
+        )
+        if wait_seconds:
+            raise _rate_limited(wait_seconds)
         if is_new_thread:
             await thread_repo.create(queue_id, principal.id, thread_repo.make_title(request.message))
             thread_created = True
@@ -195,7 +217,7 @@ async def create_resume_task(request: ResumeRequest, principal: Principal = Depe
             kind="resume",
             thread_id=request.thread_id,
             user_id=principal.id,
-            payload={"decisions": request.decisions},
+            payload={"decisions": [d.model_dump(exclude_none=True) for d in request.decisions]},
         )
     except tq.ThreadBusyError as exc:
         return JSONResponse(

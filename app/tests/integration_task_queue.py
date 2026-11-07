@@ -28,9 +28,13 @@ sys.stdout.reconfigure(encoding="utf-8")
 import httpx  # noqa: E402
 
 import app.worker as worker  # noqa: E402
+from app.common import rate_limit  # noqa: E402
 from app.common import task_queue as tq  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services import db, history  # noqa: E402
+
+# 這裡測的是佇列，要連續送很多訊息；速率限制由 integration_auth.py 測
+rate_limit.GUEST_LIMITS = rate_limit.USER_LIMITS = ()
 
 running_now = 0
 max_running = 0

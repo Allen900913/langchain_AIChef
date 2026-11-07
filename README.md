@@ -73,7 +73,7 @@ FastAPI + LangGraph 打造的私廚助理：依冰箱庫存、飲食限制與廚
 | `COOKIE_SECURE` | `api/deps.py` | 選用，預設 `true`。用區網 IP 以 http 測試時設 `false`（`http://localhost` 不需要） |
 | `CORS_ORIGINS` | `main.py` | 選用，預設 `http://localhost:5173`（Vite 開發伺服器），逗號分隔。寫入請求的 Origin 檢查也信任這份清單 |
 | `SITE_ADDRESS` | `docker-compose.yml` → `Caddyfile` | 選用，預設 `localhost`。填正式網域就自動向 Let's Encrypt 申請憑證 |
-| `ACCESS_TOKEN_MINUTES`、`REFRESH_TOKEN_DAYS`、`GUEST_TTL_HOURS` | token 期限 | 選用，預設 15 分鐘 / 30 天 / 24 小時 |
+| `ACCESS_TOKEN_MINUTES`、`REFRESH_TOKEN_DAYS`、`REFRESH_ABSOLUTE_DAYS`、`GUEST_TTL_HOURS` | token 期限（refresh 分閒置與絕對期限） | 選用，預設 15 分鐘 / 7 天 / 30 天 / 24 小時 |
 | `CLEANUP_INTERVAL_SECONDS` | `main.py` 過期 refresh token 清理週期 | 選用，預設 3600 |
 | `WORKER_CONCURRENCY` | `worker.py` 每台同時處理的任務數 | 選用，預設 4 |
 | `NVIDIA_API_KEY` | `evals/run_eval.py` 的 judge 模型 | 只有跑 `run_eval` 才需要 |

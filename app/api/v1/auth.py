@@ -5,7 +5,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api import deps
 from app.common import task_queue as tq
@@ -18,15 +18,17 @@ _LOGIN_FAIL_LIMIT = 10
 _LOGIN_FAIL_WINDOW = 15 * 60
 
 
+# 長度在這裡先擋：這兩支 API 不用登入，超長的 email 不該進到 regex，也不該變成 Redis 鍵。
+# 太短、格式不對由 services/auth.py 檢查，回傳可以直接顯示給使用者的中文訊息。
 class RegisterRequest(BaseModel):
-    email: str
-    password: str
-    display_name: str | None = None
+    email: str = Field(max_length=auth.EMAIL_MAX)
+    password: str = Field(max_length=auth.PASSWORD_MAX)
+    display_name: str | None = Field(default=None, max_length=auth.DISPLAY_NAME_MAX)
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=auth.EMAIL_MAX)
+    password: str = Field(max_length=auth.PASSWORD_MAX)
 
 
 def _fail_key(email: str) -> str:

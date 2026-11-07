@@ -215,8 +215,8 @@ POST /chat/tasks（沒有 access cookie）
 
 | cookie | 內容 | 期限 | 說明 |
 |--------|------|------|------|
-| `chef_access` | JWT（typ=access） | token 15 分鐘；cookie 留 30 天 | 驗簽即可，不查資料庫。cookie 留得跟 refresh 一樣久：token 過期時伺服器回 401、前端換新重試；cookie 若跟著 15 分鐘消失，伺服器會把人當成未登入 / 訪客（送訊息不保存） |
-| `chef_refresh` | 隨機字串（DB 只存 SHA-256） | 30 天 | 只送到 `/api/v1/auth`；每用一次就換新；舊 token 超過 30 秒寬限又出現 → 撤銷該使用者全部 refresh token |
+| `chef_access` | JWT（typ=access） | token 15 分鐘；cookie 留 7 天 | 驗簽即可，不查資料庫。cookie 留得跟 refresh 一樣久：token 過期時伺服器回 401、前端換新重試；cookie 若跟著 15 分鐘消失，伺服器會把人當成未登入 / 訪客（送訊息不保存） |
+| `chef_refresh` | 隨機字串（DB 只存 SHA-256） | 閒置 7 天；從輸入密碼算起最多 30 天 | 只送到 `/api/v1/auth`；每用一次就換新，閒置期限往後推，絕對期限只繼承不延長（時間到整條鏈失效，access token 最多再用 15 分鐘）；舊 token 在 10 秒寬限內重送只換 access token（不開第二條鏈），超過寬限又出現 → 撤銷該使用者全部 refresh token；登出或已撤銷的 token 一律拒絕，沒有寬限 |
 | `chef_guest` | JWT（typ=guest，sub=`guest:<hex>`） | 24 小時 | 訪客 session 鑰匙，沒有資料 |
 
 `/auth/me` 沒有 access cookie 但有 refresh cookie 時也回 401（讓前端換新），舊版 15 分鐘就消失的 access cookie 一樣能自動恢復登入。
@@ -228,11 +228,17 @@ CSRF：SameSite=Lax 擋跨站 POST 帶 cookie，`main.py` 再檢查寫入請求�
 
 密碼：Argon2id，長度 8–128；帳號不存在時也跑一次雜湊比對，回應時間看不出 email 有沒有註冊。
 
+輸入長度（超過一律 422，`models/schemas.py`、`api/v1/auth.py`）：訊息去掉前後空白後 1–2,000 字（約 2,100 tokens，Groq TPM 只有 8,000）、`thread_id` 64、HITL 決定 50 筆、email 254、密碼 128、暱稱 50。
+圖片網址的長度由 `check_message_image_url` 檢查：Data URL 不超過 2.5MB 原圖換算的長度、簽名 URL 不超過 4,096。
+
+速率限制（`common/rate_limit.py`，只限 `POST /chat/tasks`，用來保護模型額度，不是 DDoS 防護）：訪客看 IP，每分鐘 3 則、每天 10 則；登入使用者看 `user_id`，每分鐘 5 則、每天 30 則。超過回 429 + `Retry-After`；被擋的請求不計數，冪等重送不扣額度。
+真實 IP 取自 `X-Forwarded-For` 最右邊的值（`api/deps.py` 的 `client_ip`）：Caddy 會覆蓋使用者送來的值，nginx 原樣轉送；只有連線來自內部位址才採用。IPv6 以 /64 計算。Docker Desktop 的 port 轉發可能看不到外部機器的真實 IP，此時所有訪客會共用同一份額度；正式環境部署後要實測。
+
 ### 資料表（API 啟動時遷移，`services/db.py`）
 
 ```
 users          (id uuid, email unique, password_hash argon2id, display_name, created_at)
-refresh_tokens (id, user_id → users, token_hash unique, expires_at, revoked_at)
+refresh_tokens (id, user_id → users, token_hash unique, expires_at, absolute_expires_at, rotated_at, revoked_at)
 threads        (thread_id, owner_id = 使用者 uuid, title, created_at, updated_at)   ← RLS
 store          （LangGraph 建立）                                                   ← RLS（只對 chef_rls_reader）
 ```

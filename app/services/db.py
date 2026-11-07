@@ -62,6 +62,20 @@ _MIGRATIONS: list[tuple[int, str]] = [
     DROP INDEX IF EXISTS threads_guest_expiry_idx;
     ALTER TABLE threads DROP COLUMN is_guest, DROP COLUMN expires_at;
     """ + rls.THREADS_RLS_SQL),
+    # v3：把「換發過」和「被撤銷」分開記。之前都記在 revoked_at，寬限期又只看這個欄位，
+    #     導致登出或被全部撤銷的 token 在寬限期內還能換發。
+    #     舊資料分不出是哪一種，一律維持撤銷（比較安全），所以不回填 rotated_at。
+    (3, """
+    ALTER TABLE refresh_tokens ADD COLUMN rotated_at timestamptz;
+    """),
+    # v4：絕對期限。expires_at 每次換發都會往後推（閒置期限），一直換發就永遠不會過期；
+    #     absolute_expires_at 在登入時決定，換發只繼承不延長。
+    #     舊資料不知道當初何時登入，以目前的到期時間當期限：不會立刻踢人，之後也延長不了。
+    (4, """
+    ALTER TABLE refresh_tokens ADD COLUMN absolute_expires_at timestamptz;
+    UPDATE refresh_tokens SET absolute_expires_at = expires_at;
+    ALTER TABLE refresh_tokens ALTER COLUMN absolute_expires_at SET NOT NULL;
+    """),
 ]
 
 

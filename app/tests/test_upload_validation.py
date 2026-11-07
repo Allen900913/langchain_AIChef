@@ -97,6 +97,7 @@ def test_check_url():
         ("帶 port", f"https://storage.googleapis.com:8443/{bucket}/uploads/{uid}/a.png", uid),
         ("帶帳密的網址", f"https://x@evil.com/{bucket}/uploads/{uid}/a.png", uid),
         ("訪客用 GCS 網址", own, None),
+        ("超長的 GCS 網址", own + "x" * 5000, uid),
     ]
     for name, url, user in bad_cases:
         err = check_message_image_url(url, user, bucket)

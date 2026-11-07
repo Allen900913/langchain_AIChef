@@ -115,6 +115,8 @@ async function request<T>(path: string, init?: RequestInit, retried = false): Pr
     try {
       const body = await res.json();
       if (typeof body.detail === 'string') detail = body.detail;
+      // FastAPI 的欄位驗證錯誤：detail 是陣列，內容是給開發者看的英文
+      else if (Array.isArray(body.detail)) detail = '輸入內容不符合規定，可能超過長度上限';
     } catch {
       /* 非 JSON 回應 */
     }
